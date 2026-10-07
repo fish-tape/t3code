@@ -37,6 +37,7 @@ interface AcpRegistrySearchStepProps {
   readonly onPrepared: (agent: AcpRegistrySearchAgent) => void;
   readonly onManualConfiguration: () => void;
   readonly onLocalConfiguration?: () => void;
+  readonly onFishTapeConfiguration?: () => void;
   readonly onLoadingChange?: (loading: boolean) => void;
   readonly onPreparingChange?: (preparing: boolean) => void;
 }
@@ -59,6 +60,7 @@ export function AcpRegistrySearchStep({
   onPrepared,
   onManualConfiguration,
   onLocalConfiguration,
+  onFishTapeConfiguration,
   onLoadingChange,
   onPreparingChange,
 }: AcpRegistrySearchStepProps) {
@@ -184,6 +186,17 @@ export function AcpRegistrySearchStep({
             variant="outline"
           >
             Local ACP command
+          </Button>
+        ) : null}
+        {onFishTapeConfiguration ? (
+          <Button
+            disabled={preparingId !== null}
+            onClick={onFishTapeConfiguration}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            Fish Tape remote agent
           </Button>
         ) : null}
       </form>

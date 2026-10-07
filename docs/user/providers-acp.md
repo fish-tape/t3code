@@ -34,6 +34,22 @@ credentials and skills remain managed by the installed agent or its wrapper. Mod
 options come from ACP, including model IDs that contain JSON. T3 Code launches the executable directly
 without expanding shell expressions.
 
+## Use Fish Tape Remote Agent
+
+The Fish Tape preset connects T3 Code to a durable remote agent through the
+`@fish-tape/remote-agent-adapter` controller bridge. Install the package on the environment that
+hosts T3 Code so `fishtape-acp-controller-bridge` is on `PATH`, then open **Settings → Providers →
+Add provider → Fish Tape remote agent**. Enter the controller URL and bearer token in the generated
+environment rows. Leave `FISHTAPE_SESSION_ID` empty for normal use so each T3 thread gets a separate
+session; set it only when intentionally attaching to one existing job. `FISHTAPE_REMOTE_CWD` selects
+a workspace path inside the sandbox when it differs from the local project path.
+
+The preset is still a local ACP command from T3 Code's perspective. The bridge forwards ACP traffic
+to the controller, so the sandbox, provider CLI, and durable session remain outside T3 Code.
+Configure the instance from web or desktop; mobile can use the configured provider through its
+existing ACP support. T3's file browser, terminal, and checkpoints still operate on the T3 server's
+workspace, so a separate sandbox workspace needs its own file synchronization.
+
 ## Where agents run
 
 Registry agents always run on the machine that hosts your T3 Code server. That stays true when you

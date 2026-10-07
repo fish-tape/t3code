@@ -1,4 +1,9 @@
-import { EnvironmentId, ProviderDriverKind, type AcpRegistrySearchAgent } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProviderDriverKind,
+  type AcpRegistrySearchAgent,
+  type ProviderInstanceEnvironmentVariable,
+} from "@t3tools/contracts";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { visitElements } from "../../test/reactElementTree";
@@ -357,6 +362,73 @@ describe("AddProviderInstanceDialog environment routing", () => {
           element.type.name === "ProviderWizardAuthenticationStep",
       ),
     ).toBeNull();
+  });
+
+  it("saves Fish Tape connection settings on the selected environment as a local ACP provider", async () => {
+    const onOpenChange = vi.fn();
+    let tree = render(onOpenChange);
+    const search = visitElements(
+      tree,
+      (element) =>
+        typeof element.type === "function" && element.type.name === "AcpRegistrySearchStep",
+    );
+    (search!.props.onFishTapeConfiguration as () => void)();
+    tree = render(onOpenChange);
+
+    const environmentEditor = visitElements(
+      tree,
+      (element) =>
+        typeof element.type === "function" && element.type.name === "ProviderEnvironmentSection",
+    );
+    const environment = (
+      environmentEditor!.props.environment as ReadonlyArray<ProviderInstanceEnvironmentVariable>
+    ).map((variable) => ({
+      ...variable,
+      value:
+        variable.name === "FISHTAPE_CONTROLLER_URL"
+          ? "https://controller.example.test"
+          : variable.name === "FISHTAPE_CONTROLLER_TOKEN"
+            ? "test-controller-token"
+            : variable.value,
+    }));
+    (
+      environmentEditor!.props.onChange as (
+        value: ReadonlyArray<ProviderInstanceEnvironmentVariable>,
+      ) => void
+    )(environment);
+    tree = render(onOpenChange);
+    (findByChildren(tree, "Next").props.onClick as () => void)();
+    tree = render(onOpenChange);
+    (findByChildren(tree, "Add instance").props.onClick as () => void)();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(settingsHooks.mutate).toHaveBeenCalledWith({
+      operation: "create",
+      instanceId: "acpRegistry_fish_tape_remote_agent",
+      instance: {
+        driver: "acpRegistry",
+        enabled: true,
+        displayName: "Fish Tape Remote Agent",
+        config: {
+          source: "local",
+          commandPath: "fishtape-acp-controller-bridge",
+          commandArgs: [],
+        },
+        environment: [
+          {
+            name: "FISHTAPE_CONTROLLER_URL",
+            value: "https://controller.example.test",
+            sensitive: false,
+          },
+          { name: "FISHTAPE_CONTROLLER_TOKEN", value: "test-controller-token", sensitive: true },
+          { name: "FISHTAPE_SESSION_ID", value: "", sensitive: false },
+          { name: "FISHTAPE_REMOTE_CWD", value: "", sensitive: false },
+        ],
+      },
+    });
+    expect(settingsHooks.useMutation).toHaveBeenCalledWith(remoteEnvironmentId);
+    expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
   it("keeps the dialog open when the atomic upsert fails", async () => {
