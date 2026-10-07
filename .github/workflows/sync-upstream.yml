@@ -1,9 +1,9 @@
 name: Sync upstream T3 Code
 
 on:
-  schedule:
-    # Keep the fork current without making every upstream push a separate job.
-    - cron: "17 3 * * *"
+  # The Fish Tape upstream poller dispatches this workflow after it observes a
+  # new upstream commit. Keeping the merge logic here makes the GitHub token
+  # and conflict reporting local to the fork.
   workflow_dispatch:
 
 permissions:
