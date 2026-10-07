@@ -56,6 +56,7 @@ import { ProviderWizardAuthenticationStep } from "./ProviderWizardAuthentication
 import { resolveOfficialAcpRegistryIconUrl } from "./AcpRegistryIcon";
 import { AddManagedCodexAccountDialog } from "./CodexSetupSection";
 import { ProviderEnvironmentSection } from "./ProviderInstanceCard";
+import { createFishTapeProviderPreset, FISH_TAPE_PROVIDER_LABEL } from "./fishTapeProviderPreset";
 
 /**
  * Normalize a user-provided label into a slug suffix for the instance id.
@@ -310,6 +311,25 @@ export function AddProviderInstanceDialog({
     setHasAttemptedSubmit(false);
   };
 
+  const handleFishTapeConfiguration = () => {
+    const preset = createFishTapeProviderPreset();
+    setDriver(ACP_REGISTRY_DRIVER_KIND);
+    setSelectedAcp(null);
+    setIsManualAcpConfiguration(true);
+    setConfigByDriver((existing) => ({
+      ...existing,
+      [ACP_REGISTRY_DRIVER_KIND]: { ...preset.config },
+    }));
+    setIdentityByDriver((existing) =>
+      updateProviderIdentityDraft(existing, ACP_REGISTRY_DRIVER_KIND, {
+        label: FISH_TAPE_PROVIDER_LABEL,
+        instanceIdOverride: null,
+      }),
+    );
+    setLocalEnvironment(preset.environment);
+    setHasAttemptedSubmit(false);
+  };
+
   const handleSave = async () => {
     if (!readEnvironmentScope(environmentId, AuthProvidersManageScope)) return;
     if (isSaving || createdInstanceId) return;
@@ -525,6 +545,7 @@ export function AddProviderInstanceDialog({
                         onPrepared={handleAcpPrepared}
                         onManualConfiguration={handleManualAcpConfiguration}
                         onLocalConfiguration={handleLocalAcpConfiguration}
+                        onFishTapeConfiguration={handleFishTapeConfiguration}
                         onLoadingChange={setIsRegistryLoading}
                         onPreparingChange={setIsPreparingRegistryAgent}
                       />
