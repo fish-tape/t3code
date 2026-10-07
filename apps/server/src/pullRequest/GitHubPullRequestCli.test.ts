@@ -767,11 +767,15 @@ layer("GitHubPullRequestCli.layer", (it) => {
       );
       assert.strictEqual(eight?.headBranch, "feat/8");
       expect(mockedExecute).toHaveBeenCalledOnce();
-      const document = queryAt(0);
-      expect(document).toContain(
-        's0: repository(owner: "acme", name: "web") { pullRequest(number: 7)',
+      expect(queryAt(0)).toContain(
+        "s0: repository(owner: $s0_owner, name: $s0_name) { pullRequest(number: $s0_number)",
       );
-      expect(document).toContain("pullRequest(number: 8)");
+      expect(varsAt(0)).toMatchObject({
+        s0_owner: "acme",
+        s0_name: "web",
+        s0_number: 7,
+        s1_number: 8,
+      });
     }),
   );
 
@@ -815,10 +819,10 @@ layer("GitHubPullRequestCli.layer", (it) => {
       // GitHub had no answer for #8, so its watch reads it in full.
       expect(eight).toBeNull();
       expect(mockedExecute).toHaveBeenCalledOnce();
-      const call = callAt(0);
-      expect(call.kind === "graphql" ? call.query : "").toContain(
-        'w1: repository(owner: "acme", name: "web") { pullRequest(number: 8)',
+      expect(queryAt(0)).toContain(
+        "w1: repository(owner: $w1_owner, name: $w1_name) { pullRequest(number: $w1_number)",
       );
+      expect(varsAt(0)).toMatchObject({ w1_owner: "acme", w1_name: "web", w1_number: 8 });
     }),
   );
 
@@ -1408,11 +1412,12 @@ layer("GitHubPullRequestCli.layer", (it) => {
       expect(batch.continues).toBe(false);
       expect(mockedStackMemberships).toHaveBeenCalledTimes(1);
       const membership = mockedStackMemberships.mock.calls[0]?.[0];
-      const query = membership?.kind === "graphql" ? membership.query : "";
-      expect(query).toContain("pullRequest(number: 4)");
-      expect(query).toContain("pullRequest(number: 5)");
-      expect(query).not.toContain("pullRequest(number: 1)");
-      expect(query).not.toContain("pullRequest(number: 6)");
+      const numbers = Object.entries(
+        membership?.kind === "graphql" ? (membership.variables ?? {}) : {},
+      )
+        .filter(([name]) => name.endsWith("_number"))
+        .map(([, number]) => number);
+      expect(numbers).toEqual([4, 5]);
     }),
   );
 
@@ -1420,7 +1425,7 @@ layer("GitHubPullRequestCli.layer", (it) => {
     Effect.gen(function* () {
       mockedExecute.mockReturnValueOnce(Effect.succeed(output(pullRequests(27, 1))));
       mockedStackMemberships.mockImplementation((input) =>
-        input.kind === "graphql" && input.query.includes("pullRequest(number: 26)")
+        input.kind === "graphql" && Object.values(input.variables ?? {}).includes(26)
           ? Effect.fail(
               new GitHubApi.GitHubApiResponseError({
                 host: "github.com",
@@ -1513,9 +1518,8 @@ layer("GitHubPullRequestCli.layer", (it) => {
         { repository: "acme/web", number: 1, additions: 4, deletions: 1 },
         { repository: "acme/web", number: 26, additions: 4, deletions: 1 },
       ]);
-      const document = queryAt(0);
-      expect(document).toContain('s0: repository(owner: "acme", name: "web")');
-      expect(document).toContain("pullRequest(number: 25)");
+      expect(queryAt(0)).toContain("s0: repository(owner: $s0_owner, name: $s0_name)");
+      expect(varsAt(0)).toMatchObject({ s0_owner: "acme", s0_name: "web", s24_number: 25 });
     }),
   );
 
@@ -4386,9 +4390,9 @@ layer("GitHubPullRequestCli.layer", (it) => {
         number: 7,
       });
 
-      assert.strictEqual(mockedExecute.mock.calls.length, 5);
+      // The same cursor twice is a page GitHub already gave, so reading stops there.
+      assert.strictEqual(mockedExecute.mock.calls.length, 2);
       assert.isTrue(viewed.truncated);
-      assert.strictEqual(viewed.files.length, 5);
     }),
   );
 
@@ -4420,8 +4424,8 @@ layer("GitHubPullRequestCli.layer", (it) => {
       expect(queryAt(1)).toContain("f1: unmarkFileAsViewed");
       expect(varsAt(1)).toEqual({
         pullRequestId: "PR_1",
-        path0: "src/a.ts",
-        path1: "src/b.ts",
+        f0_path: "src/a.ts",
+        f1_path: "src/b.ts",
       });
     }),
   );
