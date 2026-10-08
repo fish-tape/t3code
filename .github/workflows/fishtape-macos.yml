@@ -1,0 +1,59 @@
+name: Fish Tape macOS compatibility build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build"
+        required: true
+        default: fishtape/compatible-v1
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: false
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1.16.1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install dependencies
+        run: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      - name: Configure public build settings
+        run: cp .env.example .env
+
+      - name: Build unsigned Apple Silicon DMG
+        run: vp run dist:desktop:dmg:arm64
+        env:
+          T3CODE_DESKTOP_SIGNED: "false"
+          T3CODE_DESKTOP_OUTPUT_DIR: release
+
+      - name: Inspect artifact
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(release/*.dmg)
+          test ${#files[@]} -eq 1
+          hdiutil imageinfo "${files[0]}" | grep -E "image-size|block-size"
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: fish-tape-macos-arm64
+          path: release/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
