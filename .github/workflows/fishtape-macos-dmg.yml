@@ -1,0 +1,70 @@
+name: Fish Tape macOS DMG
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build
+        required: false
+        default: main
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    name: Build Fish Tape macOS arm64 DMG
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ inputs.ref || github.sha }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 checkout --detach FETCH_HEAD
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26e8
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install dependencies
+        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      - name: Configure public release identifiers
+        run: cp .env.example .env
+
+      - name: Build DMG
+        env:
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: fish-tape/t3code
+        run: |
+          vp exec -- node scripts/build-desktop-artifact.ts \
+            --platform mac \
+            --target dmg \
+            --arch arm64 \
+            --build-version "0.0.45-fishtape.${GITHUB_RUN_NUMBER}" \
+            --verbose
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: fishtape-macos-arm64-dmg-${{ github.run_number }}
+          path: release/*.dmg
+          if-no-files-found: error
