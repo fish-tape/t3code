@@ -405,6 +405,10 @@ available.
 - Repository slug source:
   - `T3CODE_DESKTOP_UPDATE_REPOSITORY` (format `owner/repo`), if set.
   - otherwise `GITHUB_REPOSITORY` from GitHub Actions.
+- Fish Tape fork packaging:
+  - The forked desktop product is `T3 Code (Fish Tape)` with app ID `com.fish-tape.t3code`, so it can be installed beside official T3 Code.
+  - Run this same workflow from `fish-tape/t3code`; its `GITHUB_REPOSITORY` value points updater metadata and release assets at the fork.
+  - Local packaging must set `T3CODE_DESKTOP_UPDATE_REPOSITORY=fish-tape/t3code` explicitly.
 - Required release assets for updater:
   - platform installers (`.exe`, `.dmg`, `.AppImage`, `.deb`, plus macOS `.zip` for Squirrel.Mac update payloads)
   - channel metadata: `latest*.yml` for stable releases, `nightly*.yml` for nightly releases

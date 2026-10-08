@@ -5,10 +5,17 @@ import type { ProviderInstanceEnvironmentVariable } from "@t3tools/contracts";
  * client so adding the provider does not require a second server-side driver;
  * T3's existing local ACP driver owns process startup and protocol handling.
  */
-export const FISH_TAPE_PROVIDER_LABEL = "Fish Tape Remote Agent";
+export type FishTapeAgent = "codex" | "claude";
+
+export const FISH_TAPE_PROVIDER_LABELS = {
+  codex: "Fish Tape · Codex",
+  claude: "Fish Tape · Claude",
+} as const;
+
 const FISH_TAPE_ACP_COMMAND = "fishtape-acp-controller-bridge";
 
 interface FishTapeProviderPreset {
+  readonly label: string;
   readonly config: {
     readonly source: "local";
     readonly commandPath: string;
@@ -18,8 +25,9 @@ interface FishTapeProviderPreset {
 }
 
 /** Return fresh rows so editing one add-provider dialog cannot mutate another. */
-export function createFishTapeProviderPreset(): FishTapeProviderPreset {
+export function createFishTapeProviderPreset(agent: FishTapeAgent): FishTapeProviderPreset {
   return {
+    label: FISH_TAPE_PROVIDER_LABELS[agent],
     config: {
       source: "local",
       commandPath: FISH_TAPE_ACP_COMMAND,

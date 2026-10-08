@@ -24,6 +24,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { isConfiguredAcpRegistryAgent } from "./AddProviderInstanceDialog.logic";
 import { ProviderDriverKind } from "@t3tools/contracts";
 import { ProviderInstanceIcon } from "../chat/ProviderInstanceIcon";
+import { FISH_TAPE_PROVIDER_LABELS, type FishTapeAgent } from "./fishTapeProviderPreset";
 
 function errorMessage(error: unknown): string {
   return error instanceof Error && error.message.trim()
@@ -37,7 +38,7 @@ interface AcpRegistrySearchStepProps {
   readonly onPrepared: (agent: AcpRegistrySearchAgent) => void;
   readonly onManualConfiguration: () => void;
   readonly onLocalConfiguration?: () => void;
-  readonly onFishTapeConfiguration?: () => void;
+  readonly onFishTapeConfiguration?: (agent: FishTapeAgent) => void;
   readonly onLoadingChange?: (loading: boolean) => void;
   readonly onPreparingChange?: (preparing: boolean) => void;
 }
@@ -189,15 +190,20 @@ export function AcpRegistrySearchStep({
           </Button>
         ) : null}
         {onFishTapeConfiguration ? (
-          <Button
-            disabled={preparingId !== null}
-            onClick={onFishTapeConfiguration}
-            size="sm"
-            type="button"
-            variant="outline"
-          >
-            Fish Tape remote agent
-          </Button>
+          <>
+            {(["codex", "claude"] as const).map((agent) => (
+              <Button
+                key={agent}
+                disabled={preparingId !== null}
+                onClick={() => onFishTapeConfiguration(agent)}
+                size="sm"
+                type="button"
+                variant="outline"
+              >
+                {FISH_TAPE_PROVIDER_LABELS[agent]}
+              </Button>
+            ))}
+          </>
         ) : null}
       </form>
 

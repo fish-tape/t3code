@@ -56,7 +56,7 @@ import { ProviderWizardAuthenticationStep } from "./ProviderWizardAuthentication
 import { resolveOfficialAcpRegistryIconUrl } from "./AcpRegistryIcon";
 import { AddManagedCodexAccountDialog } from "./CodexSetupSection";
 import { ProviderEnvironmentSection } from "./ProviderInstanceCard";
-import { createFishTapeProviderPreset, FISH_TAPE_PROVIDER_LABEL } from "./fishTapeProviderPreset";
+import { createFishTapeProviderPreset, type FishTapeAgent } from "./fishTapeProviderPreset";
 
 /**
  * Normalize a user-provided label into a slug suffix for the instance id.
@@ -311,8 +311,8 @@ export function AddProviderInstanceDialog({
     setHasAttemptedSubmit(false);
   };
 
-  const handleFishTapeConfiguration = () => {
-    const preset = createFishTapeProviderPreset();
+  const handleFishTapeConfiguration = (agent: FishTapeAgent) => {
+    const preset = createFishTapeProviderPreset(agent);
     setDriver(ACP_REGISTRY_DRIVER_KIND);
     setSelectedAcp(null);
     setIsManualAcpConfiguration(true);
@@ -322,7 +322,7 @@ export function AddProviderInstanceDialog({
     }));
     setIdentityByDriver((existing) =>
       updateProviderIdentityDraft(existing, ACP_REGISTRY_DRIVER_KIND, {
-        label: FISH_TAPE_PROVIDER_LABEL,
+        label: preset.label,
         instanceIdOverride: null,
       }),
     );
