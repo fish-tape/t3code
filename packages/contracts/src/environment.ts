@@ -10,8 +10,11 @@ import {
 } from "./baseSchemas.ts";
 
 /** Wire version for orchestration snapshots, streams, commands, and RPC payloads. */
-export const ORCHESTRATION_PROTOCOL_VERSION = 2;
-export const ORCHESTRATION_PROTOCOL_VERSION_TEXT = "2";
+// Keep the Fish Tape desktop compatible with shipped T3 environments.
+// The provider runtime is newer than the stable app, but its connection wire
+// protocol remains v1 so existing environments can continue to connect.
+export const ORCHESTRATION_PROTOCOL_VERSION = 1;
+export const ORCHESTRATION_PROTOCOL_VERSION_TEXT = "1";
 export const ORCHESTRATION_PROTOCOL_QUERY_PARAM = "orchestrationProtocol";
 export const ORCHESTRATION_PROTOCOL_HEADER = "x-t3-orchestration-protocol";
 
