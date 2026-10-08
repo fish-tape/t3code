@@ -1,6 +1,8 @@
 name: Fish Tape macOS compatibility build
 
 on:
+  push:
+    branches: [fishtape/compatible-v1]
   workflow_dispatch:
     inputs:
       ref:
