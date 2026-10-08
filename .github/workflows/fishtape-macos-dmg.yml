@@ -33,7 +33,7 @@ jobs:
           git -c checkout.workers=0 checkout --detach FETCH_HEAD
 
       - name: Setup Vite+
-        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26e8
+        uses: voidzero-dev/setup-vp@v1.16.1
         with:
           node-version-file: package.json
           cache: true
