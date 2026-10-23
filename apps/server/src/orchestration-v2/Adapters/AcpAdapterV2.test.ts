@@ -14404,3 +14404,200 @@ describe("acpPostSettleMonitorPromptShouldSuppress", () => {
     );
   });
 });
+
+it.live("reattaches a durable prompt and rehydrates saved chunks without duplicate items", () =>
+  Effect.gen(function* () {
+    const key = "io.t3code/durable-prompt";
+    const instanceId = ProviderInstanceId.make("durable-test");
+    const threadId = ThreadId.make("thread:durable-test");
+    const runtimePolicy = ProviderAdapterV2RuntimePolicy.make({
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      cwd: process.cwd(),
+    });
+    const modelSelection = { instanceId, model: "default" } as const;
+    const prompts: Parameters<AcpSessionRuntime.AcpSessionRuntime["Service"]["prompt"]>[0][] = [];
+    let handler: Parameters<
+      AcpSessionRuntime.AcpSessionRuntime["Service"]["handleSessionUpdate"]
+    >[0];
+    const path = yield* Path.Path;
+    const baseRuntime = makeMockRuntime({
+      childProcessSpawner: yield* ChildProcessSpawner.ChildProcessSpawner,
+      mockAgentPath: yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      ),
+      wrapRuntime: (runtime) => ({
+        ...runtime,
+        start: () =>
+          runtime.start().pipe(
+            Effect.map((result) => ({
+              ...result,
+              initializeResult: { ...result.initializeResult, _meta: { [key]: { version: 1 } } },
+            })),
+          ),
+        handleSessionUpdate: (callback) => {
+          handler = callback;
+          return runtime.handleSessionUpdate(callback);
+        },
+        prompt: (payload) =>
+          Effect.gen(function* () {
+            prompts.push(payload);
+            const identity = payload._meta?.[key] as { turnId: string };
+            const setup = yield* runtime.start();
+            for (const [sequence, text] of [
+              [1, "already saved"],
+              [2, " and missed output"],
+            ] as const) {
+              yield* handler({
+                sessionId: setup.sessionId,
+                _meta: { [key]: { turnId: identity.turnId, sequence } },
+                update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+              });
+            }
+            return { stopReason: "end_turn" as const };
+          }),
+      }),
+    });
+    const adapter = makeAcpAdapterV2({
+      crypto: yield* Crypto.Crypto,
+      instanceId,
+      fileSystem: yield* FileSystem.FileSystem,
+      idAllocator: yield* IdAllocator.IdAllocatorV2,
+      serverConfig: yield* ServerConfig.ServerConfig,
+      selfInvocation: yield* resolveSelfInvocation(),
+      flavor: {
+        driver: ACP_TEST_DRIVER,
+        capabilities: AcpProviderCapabilitiesV2,
+        makeRuntime: baseRuntime,
+      },
+    });
+    const first = yield* adapter.openSession({
+      threadId,
+      modelSelection,
+      runtimePolicy,
+      providerSessionId: ProviderSessionId.make("session:durable-first"),
+    });
+    const providerThread = yield* first.ensureThread({ threadId, modelSelection, runtimePolicy });
+    const original = makeTurnInput({
+      threadId,
+      providerThread,
+      instanceId,
+      runtimePolicy,
+      now: yield* DateTime.now,
+    });
+    yield* first.startTurn(original);
+    const initial = yield* first.events.pipe(
+      Stream.takeUntil((event) => event.type === "turn.terminal"),
+      Stream.runCollect,
+    );
+    const checkpoint = initial.find(
+      (event) =>
+        event.type === "provider_thread.updated" &&
+        event.providerThread.nativeMetadata?.acpDurablePrompt?.sequence === 1,
+    );
+    assert.isDefined(checkpoint);
+    if (checkpoint?.type !== "provider_thread.updated")
+      return yield* Effect.die("Missing durable checkpoint");
+    const second = yield* adapter.openSession({
+      threadId,
+      modelSelection,
+      runtimePolicy,
+      providerSessionId: ProviderSessionId.make("session:durable-replacement"),
+      initialNativeThreadId: checkpoint.providerThread.nativeThreadRef!.nativeId!,
+    });
+    yield* second.resumeThread({ providerThread: checkpoint.providerThread });
+    yield* second.startTurn({
+      ...makeTurnInput({
+        threadId,
+        providerThread: checkpoint.providerThread,
+        instanceId,
+        runtimePolicy,
+        now: yield* DateTime.now,
+        ordinal: 2,
+      }),
+      restartContinuationOfRunId: original.runId,
+    });
+    const replayed = yield* second.events.pipe(
+      Stream.takeUntil((event) => event.type === "turn.terminal"),
+      Stream.runCollect,
+    );
+    assert.deepEqual(prompts[1]?._meta?.[key], { turnId: original.runId, attach: true });
+    const initialText = initial.flatMap((event) =>
+      event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+        ? [event.turnItem]
+        : [],
+    );
+    const replayText = replayed.flatMap((event) =>
+      event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+        ? [event.turnItem]
+        : [],
+    );
+    assert.isAbove(replayText.length, 0);
+    assert.isTrue(replayText.every((item) => item.text === "already saved and missed output"));
+    assert.isTrue(replayText.every((item) => item.id === initialText[0]!.id));
+    const cursorIndex = replayed.findIndex(
+      (event) =>
+        event.type === "provider_thread.updated" &&
+        event.providerThread.nativeMetadata?.acpDurablePrompt?.sequence === 2,
+    );
+    const textIndex = replayed.findIndex(
+      (event) => event.type === "turn_item.updated" && event.turnItem.type === "assistant_message",
+    );
+    assert.isAbove(cursorIndex, textIndex);
+  }).pipe(Effect.provide(layerTest), Effect.scoped),
+);
+
+it.live("does not create a fresh ACP session when durable load is unavailable", () =>
+  Effect.gen(function* () {
+    let attempts = 0;
+    const path = yield* Path.Path;
+    const baseRuntime = makeMockRuntime({
+      childProcessSpawner: yield* ChildProcessSpawner.ChildProcessSpawner,
+      mockAgentPath: yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      ),
+      wrapRuntime: (runtime) => ({
+        ...runtime,
+        start: () => {
+          attempts++;
+          return Effect.fail(
+            new EffectAcpErrors.AcpRequestError({
+              code: -32097,
+              errorMessage: "Durable session unavailable",
+              method: "session/load",
+            }),
+          );
+        },
+      }),
+    });
+    const instanceId = ProviderInstanceId.make("durable-unavailable");
+    const adapter = makeAcpAdapterV2({
+      crypto: yield* Crypto.Crypto,
+      instanceId,
+      fileSystem: yield* FileSystem.FileSystem,
+      idAllocator: yield* IdAllocator.IdAllocatorV2,
+      serverConfig: yield* ServerConfig.ServerConfig,
+      selfInvocation: yield* resolveSelfInvocation(),
+      flavor: {
+        driver: ACP_TEST_DRIVER,
+        capabilities: AcpProviderCapabilitiesV2,
+        makeRuntime: baseRuntime,
+      },
+    });
+    const result = yield* adapter
+      .openSession({
+        threadId: ThreadId.make("thread:durable-unavailable"),
+        providerSessionId: ProviderSessionId.make("session:durable-unavailable"),
+        modelSelection: { instanceId, model: "default" },
+        initialNativeThreadId: "missing-session",
+        runtimePolicy: ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: process.cwd(),
+        }),
+      })
+      .pipe(Effect.result);
+    assert.equal(result._tag, "Failure");
+    assert.equal(attempts, 1);
+  }).pipe(Effect.provide(layerTest), Effect.scoped),
+);

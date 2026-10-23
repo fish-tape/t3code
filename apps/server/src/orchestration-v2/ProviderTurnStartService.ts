@@ -691,6 +691,12 @@ export const layer: Layer.Layer<
           return resumed.success;
         }
 
+        if (
+          run.restartContinuationOfRunId !== undefined &&
+          providerThread.nativeMetadata?.acpDurablePrompt !== undefined
+        ) {
+          return yield* loadFromProvider(Effect.fail(resumed.failure));
+        }
         yield* Effect.logWarning("Provider resume failed; attempting a fresh native session", {
           driver: session.driver,
           providerThreadId: providerThread.id,

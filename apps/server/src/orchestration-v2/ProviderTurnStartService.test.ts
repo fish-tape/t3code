@@ -166,6 +166,7 @@ function makeLocalCommandHarness(input: {
    * fallback succeeds, then reading history for its handoff fails.
    */
   readonly historyReadFailureAfterFallback?: unknown;
+  readonly durableRestart?: boolean;
   readonly interruptOpen?: boolean;
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
@@ -187,6 +188,9 @@ function makeLocalCommandHarness(input: {
   const run: OrchestrationV2ThreadProjection["runs"][number] = {
     id: runId,
     threadId,
+    ...(input.durableRestart
+      ? { restartContinuationOfRunId: RunId.make("original-durable-run") }
+      : {}),
     ordinal: 2,
     providerInstanceId: newInstanceId,
     modelSelection: { instanceId: newInstanceId, model: "gpt-5.4" },
@@ -351,7 +355,23 @@ function makeLocalCommandHarness(input: {
     projection = {
       ...projection,
       providerThreads: projection.providerThreads.map((candidate) =>
-        candidate.id === providerThreadId ? { ...candidate, nativeThreadRef } : candidate,
+        candidate.id === providerThreadId
+          ? {
+              ...candidate,
+              nativeThreadRef,
+              ...(input.durableRestart
+                ? {
+                    nativeMetadata: {
+                      acpDurablePrompt: {
+                        turnId: "original-durable-run",
+                        nativeTurnId: "native-durable-turn",
+                        sequence: 10,
+                      },
+                    },
+                  }
+                : {}),
+            }
+          : candidate,
       ),
     };
   }
@@ -381,6 +401,7 @@ function makeLocalCommandHarness(input: {
       ),
     ),
   );
+  const resumeFallbackEnsureThread = vi.fn(() => Effect.succeed(providerThread));
   const resumeFallbackSession = {
     driver: providerThread.driver,
     resumeThread: () =>
@@ -391,7 +412,7 @@ function makeLocalCommandHarness(input: {
           cause: "native thread is gone",
         }),
       ),
-    ensureThread: () => Effect.succeed(providerThread),
+    ensureThread: resumeFallbackEnsureThread,
   };
   const open = vi.fn(() =>
     input.interruptOpen === true
@@ -543,6 +564,7 @@ function makeLocalCommandHarness(input: {
     start: Effect.gen(function* () {
       yield* (yield* ProviderTurnStart.ProviderTurnStartServiceV2).start({ threadId, runId });
     }).pipe(Effect.provide(layer)),
+    resumeFallbackEnsureThread,
     startWithRetry: Effect.gen(function* () {
       yield* (yield* ProviderTurnStart.ProviderTurnStartServiceV2).start({
         threadId,
@@ -855,3 +877,19 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
       }),
   );
 }
+
+effectIt.effect(
+  "fails a durable restart when resume is unavailable instead of creating fresh work",
+  () =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        durableRestart: true,
+        historyReadFailureAfterFallback: new Error("must never read fallback history"),
+      });
+      yield* harness.start;
+      expect(harness.resumeFallbackEnsureThread).not.toHaveBeenCalled();
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+    }),
+);

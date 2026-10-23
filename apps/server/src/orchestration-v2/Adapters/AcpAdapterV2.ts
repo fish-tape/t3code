@@ -91,6 +91,13 @@ import {
   resolveEmbeddedTerminalContent,
   type AcpClientTerminals,
 } from "../../provider/acp/AcpClientTerminals.ts";
+import {
+  ACP_DURABLE_PROMPT,
+  acpDurableDelivery,
+  acpDurableTurn,
+  supportsAcpDurablePrompt,
+  acpDurableSessionUnavailable,
+} from "./AcpDurablePrompt.ts";
 import { ACP_SESSION_MODE_OPTION_ID } from "../../provider/acp/AcpSessionConfig.ts";
 import * as AcpSessionRuntime from "../../provider/acp/AcpSessionRuntime.ts";
 import {
@@ -2053,8 +2060,11 @@ export function makeAcpAdapterV2(
             }
           });
 
+        // Rehydrate the accumulated text/tool state from the journal, but publish
+        // only frames after the checkpoint T3 has already committed.
+        let suppressDurableReplay = false;
         const emitProviderEvent = (event: ProviderAdapter.ProviderAdapterV2Event) =>
-          Queue.offer(events, event).pipe(Effect.asVoid);
+          suppressDurableReplay ? Effect.void : Queue.offer(events, event).pipe(Effect.asVoid);
         let scheduleDeferredFinalize: (context: ActiveAcpTurn) => Effect.Effect<void> = () =>
           Effect.void;
 
@@ -2089,7 +2099,7 @@ export function makeAcpAdapterV2(
               },
               terminal: clientTerminals !== undefined,
               elicitation: { form: {}, ...(flavor.onUrlElicitation ? { url: {} } : {}) },
-              ...(flavor.clientCapabilitiesMeta ? { _meta: flavor.clientCapabilitiesMeta } : {}),
+              _meta: { ...flavor.clientCapabilitiesMeta, [ACP_DURABLE_PROMPT]: true },
             },
             clientInfo: { name: "t3-code", version: "0.0.0" },
             onTermination,
@@ -5452,9 +5462,58 @@ export function makeAcpAdapterV2(
                 ) ?? Effect.void
               );
             }
+            const delivery = acpDurableDelivery(rawNotification._meta);
+            const context = yield* Ref.get(activeTurn);
+            const durable =
+              context?.nativeThreadId === notification.sessionId
+                ? context.nativeMetadata?.acpDurablePrompt
+                : undefined;
+            // Ignore stale traffic from a different durable turn. It cannot be
+            // interpreted as output from the current prompt.
+            if (delivery !== undefined && durable?.turnId !== delivery.turnId) return;
+            suppressDurableReplay =
+              delivery !== undefined &&
+              durable !== undefined &&
+              delivery.sequence <= durable.sequence;
             yield* handleSessionUpdate(
               flavor.normalizeSessionUpdate?.(notification) ?? notification,
+            ).pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  suppressDurableReplay = false;
+                }),
+              ),
             );
+            if (
+              delivery === undefined ||
+              durable === undefined ||
+              context === null ||
+              delivery.sequence <= durable.sequence
+            )
+              return;
+            context.nativeMetadata = {
+              ...context.nativeMetadata,
+              acpDurablePrompt: { ...durable, sequence: delivery.sequence },
+            };
+            yield* Ref.update(nativeMetadataBySessionId, (current) =>
+              new Map(current).set(notification.sessionId, context.nativeMetadata!),
+            );
+            const known = (yield* Ref.get(providerThreadByNativeSessionId)).get(
+              notification.sessionId,
+            );
+            if (known !== undefined) {
+              const providerThread = {
+                ...known,
+                nativeMetadata: context.nativeMetadata,
+                updatedAt: yield* DateTime.now,
+              };
+              yield* Ref.update(providerThreadByNativeSessionId, (current) =>
+                new Map(current).set(notification.sessionId, providerThread),
+              );
+              // Queue the checkpoint AFTER every output event from this frame.
+              // A crash before it commits simply replays the same item snapshots.
+              yield* emitProviderEvent({ type: "provider_thread.updated", driver, providerThread });
+            }
           }).pipe(
             Effect.mapError(
               (cause) =>
@@ -6168,6 +6227,7 @@ export function makeAcpAdapterV2(
                 "method" in initialStart.failure ? initialStart.failure.method : undefined;
               if (
                 input.initialNativeThreadId === undefined ||
+                acpDurableSessionUnavailable(initialStart.failure) ||
                 (failedMethod !== "session/load" && failedMethod !== "session/resume")
               ) {
                 return yield* initialStart.failure;
@@ -6185,6 +6245,7 @@ export function makeAcpAdapterV2(
         yield* Ref.set(activeSessionSetup, started);
         rememberTerminalEnvironment(started.sessionId, input.threadId);
         const capabilities = negotiatedCapabilities(flavor.capabilities, started);
+        const durablePrompts = supportsAcpDurablePrompt(started.initializeResult._meta);
         const canLoadSession = started.initializeResult.agentCapabilities?.loadSession === true;
         const canResumeSession =
           started.initializeResult.agentCapabilities?.sessionCapabilities?.resume != null;
@@ -6421,9 +6482,11 @@ export function makeAcpAdapterV2(
           );
         });
 
-        yield* configureSession(started, input.modelSelection, input.runtimePolicy);
-        yield* Ref.set(activeSelection, input.modelSelection);
-        yield* Ref.set(activeInteractionMode, input.runtimePolicy.interactionMode);
+        if (!durablePrompts || input.initialNativeThreadId === undefined) {
+          yield* configureSession(started, input.modelSelection, input.runtimePolicy);
+          yield* Ref.set(activeSelection, input.modelSelection);
+          yield* Ref.set(activeInteractionMode, input.runtimePolicy.interactionMode);
+        }
         const createdAt = yield* DateTime.now;
         const providerSession: OrchestrationV2ProviderSession = {
           id: input.providerSessionId,
@@ -6835,16 +6898,24 @@ export function makeAcpAdapterV2(
             const restartAfterInterrupt = yield* restartRuntimeAfterTeardownIfRequired(
               turnInput.threadId,
             );
+            const durableAttach =
+              durablePrompts && turnInput.restartContinuationOfRunId !== undefined;
             const needsSessionActivation =
               (yield* Ref.get(activeSessionId)) !== requestedSessionId || restartAfterInterrupt;
             if (needsSessionActivation) {
               const activated = yield* activateSession(requestedSessionId, turnInput.threadId);
               yield* Ref.set(activeSessionId, activated.sessionId);
               yield* Ref.set(activeSessionSetup, activated);
-              yield* configureSession(activated, turnInput.modelSelection, turnInput.runtimePolicy);
-              yield* Ref.set(activeSelection, turnInput.modelSelection);
-              yield* Ref.set(activeInteractionMode, turnInput.runtimePolicy.interactionMode);
-            } else {
+              if (!durableAttach) {
+                yield* configureSession(
+                  activated,
+                  turnInput.modelSelection,
+                  turnInput.runtimePolicy,
+                );
+                yield* Ref.set(activeSelection, turnInput.modelSelection);
+                yield* Ref.set(activeInteractionMode, turnInput.runtimePolicy.interactionMode);
+              }
+            } else if (!durableAttach) {
               const configuredSelection = yield* Ref.get(activeSelection);
               const configuredInteractionMode = yield* Ref.get(activeInteractionMode);
               if (
@@ -6917,7 +6988,19 @@ export function makeAcpAdapterV2(
               ? null
               : yield* resolvePromptParts(turnInput, requestedSessionId);
             const startedAt = yield* DateTime.now;
-            const nativeTurnId = `${requestedSessionId}:turn:${turnInput.providerTurnOrdinal}`;
+            const durableTurn = durablePrompts
+              ? acpDurableTurn({
+                  sessionId: requestedSessionId,
+                  runId: turnInput.runId,
+                  ...(turnInput.restartContinuationOfRunId === undefined
+                    ? {}
+                    : { restartContinuationOfRunId: turnInput.restartContinuationOfRunId }),
+                  metadata: turnInput.providerThread.nativeMetadata,
+                })
+              : undefined;
+            const nativeTurnId =
+              durableTurn?.nativeTurnId ??
+              `${requestedSessionId}:turn:${turnInput.providerTurnOrdinal}`;
             const providerTurnId = deriveProviderTurnId(nativeTurnId);
             const completed = yield* Deferred.make<void, never>();
             const promptWireSettled = yield* Deferred.make<void, never>();
@@ -6927,12 +7010,23 @@ export function makeAcpAdapterV2(
             const rememberedNativeMetadata = (yield* Ref.get(nativeMetadataBySessionId)).get(
               requestedSessionId,
             );
-            const initialNativeMetadata =
+            const priorNativeMetadata =
               rememberedNativeMetadata === undefined
                 ? (turnInput.providerThread.nativeMetadata ?? null)
                 : {
                     ...turnInput.providerThread.nativeMetadata,
                     ...rememberedNativeMetadata,
+                  };
+            const initialNativeMetadata =
+              durableTurn === undefined
+                ? priorNativeMetadata
+                : {
+                    ...priorNativeMetadata,
+                    acpDurablePrompt: {
+                      turnId: durableTurn.turnId,
+                      nativeTurnId: durableTurn.nativeTurnId,
+                      sequence: durableTurn.sequence,
+                    },
                   };
             if (initialNativeMetadata !== null) {
               yield* Ref.update(nativeMetadataBySessionId, (current) =>
@@ -7099,7 +7193,20 @@ export function makeAcpAdapterV2(
               return;
             }
             const promptGeneration = yield* Ref.get(runtimeCallbackGeneration);
-            yield* runtime.prompt({ prompt: promptParts!.prompt }).pipe(
+            const promptPayload = {
+              prompt: promptParts!.prompt,
+              ...(durableTurn === undefined
+                ? {}
+                : {
+                    _meta: {
+                      [ACP_DURABLE_PROMPT]: {
+                        turnId: durableTurn.turnId,
+                        ...(durableTurn.attach ? { attach: true } : {}),
+                      },
+                    },
+                  }),
+            };
+            yield* runtime.prompt(promptPayload).pipe(
               Effect.tap(() =>
                 Ref.update(promptInstructionStates, (current) => {
                   if (promptParts?.instructionState === undefined) return current;
@@ -7362,9 +7469,11 @@ export function makeAcpAdapterV2(
                     yield* Ref.set(activeSessionSetup, activated);
                     const nextSelection = threadInput.modelSelection ?? input.modelSelection;
                     const nextRuntimePolicy = threadInput.runtimePolicy ?? input.runtimePolicy;
-                    yield* configureSession(activated, nextSelection, nextRuntimePolicy);
-                    yield* Ref.set(activeSelection, nextSelection);
-                    yield* Ref.set(activeInteractionMode, nextRuntimePolicy.interactionMode);
+                    if (!durablePrompts) {
+                      yield* configureSession(activated, nextSelection, nextRuntimePolicy);
+                      yield* Ref.set(activeSelection, nextSelection);
+                      yield* Ref.set(activeInteractionMode, nextRuntimePolicy.interactionMode);
+                    }
                   }
                   const now = yield* DateTime.now;
                   return {

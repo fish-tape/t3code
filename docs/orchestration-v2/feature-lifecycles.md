@@ -291,6 +291,25 @@ provider resume
 bind new ProviderSessionId to ProviderThread
 ```
 
+ACP agents can opt into durable prompt recovery through
+`initialize._meta["io.t3code/durable-prompt"] = {"version": 1}` when the client
+advertises that key. T3 sends its run ID as the stable `turnId` on each prompt.
+On server restart, recovery loads the saved native session and sends the same
+ID with `attach: true`. The agent must join the existing operation or return its
+retained completion, and reject unknown or uncertain ownership without issuing
+a new native prompt. A failed durable-session load uses error `-32097` and
+cannot fall back to creating a fresh conversation.
+
+The agent replays only that turn and tags updates with `{turnId, sequence}` under
+the same metadata key. T3 reconstructs text and tools from the replay, suppresses
+frames through its saved cursor, and upserts missed snapshots under stable item
+IDs. Cursor events follow the output they cover. These durable joins happen
+automatically; `continueThreadsAfterServerUpdate` still controls fresh
+continuation prompts for other providers. User Stop, newer user work, archived
+threads and completed root turns retain their existing recovery exclusions.
+This extension does not make a remote worker or its durable controller restart
+safe, nor does it retry tool operations lost during the outage.
+
 Provider runtime recovery flow:
 
 ```text

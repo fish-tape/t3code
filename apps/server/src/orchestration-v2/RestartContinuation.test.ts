@@ -253,13 +253,15 @@ it.effect("does not continue a failed run that lost background work", () =>
 );
 
 it.effect.each([
-  [false, undefined],
-  [true, undefined],
-  [false, true],
-  [true, false],
+  [false, undefined, false],
+  [true, undefined, false],
+  [false, true, false],
+  [true, false, false],
+  [false, undefined, true],
+  [true, false, true],
 ] as const)(
-  "atomically records restart intent with cancellation when opt-in is %s and project override is %s",
-  ([enabled, projectOverride]) =>
+  "records restart intent when opt-in is %s, project override is %s, and the turn is durable %s",
+  ([enabled, projectOverride, durable]) =>
     Effect.gen(function* () {
       let committed: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0] | undefined;
       const recovery = yield* ProviderRuntimeRecovery.make.pipe(
@@ -278,7 +280,26 @@ it.effect.each([
             }),
             Layer.mock(ProjectionStore.ProjectionStoreV2)({
               getRecoveryThreadIds: () => Effect.succeed([threadId]),
-              getRuntimeRecoveryProjection: () => Effect.succeed(makeProjection()),
+              getRuntimeRecoveryProjection: () => {
+                const projection = makeProjection();
+                return Effect.succeed({
+                  ...projection,
+                  providerThreads: projection.providerThreads.map((thread) =>
+                    durable
+                      ? {
+                          ...thread,
+                          nativeMetadata: {
+                            acpDurablePrompt: {
+                              turnId: runId,
+                              nativeTurnId: "durable-turn",
+                              sequence: 3,
+                            },
+                          },
+                        }
+                      : thread,
+                  ),
+                });
+              },
             }),
             Layer.mock(EventSink.EventSinkV2)({
               commitCommand: (input) => {
@@ -303,8 +324,8 @@ it.effect.each([
           (event) => event.type === "run.updated" && event.payload.status === "cancelled",
         ),
       );
-      assert.lengthOf(committed!.effects, (projectOverride ?? enabled) ? 1 : 0);
-      if (projectOverride ?? enabled)
+      assert.lengthOf(committed!.effects, durable || (projectOverride ?? enabled) ? 1 : 0);
+      if (durable || (projectOverride ?? enabled))
         assert.deepEqual(committed!.effects[0]?.request, {
           type: "provider-runtime.continue",
           sourceRunId: runId,
@@ -813,6 +834,43 @@ it.effect("prepares later threads' continuations when one thread fails", () =>
     assert.deepEqual(
       writes.map((write) => write.effects[0]?.request),
       [{ type: "provider-runtime.continue", sourceRunId: runId }],
+    );
+  }),
+);
+
+it.effect("dispatches a durable attach with fresh prompting disabled", () =>
+  Effect.gen(function* () {
+    const base = makeProjection();
+    const projection = {
+      ...base,
+      runs: [{ ...base.runs[0]!, status: "cancelled" as const }],
+      providerThreads: base.providerThreads.map((thread) => ({
+        ...thread,
+        nativeMetadata: {
+          acpDurablePrompt: { turnId: runId, nativeTurnId: "durable-turn", sequence: 3 },
+        },
+      })),
+    };
+    const commands: unknown[] = [];
+    yield* continueRestartedRun({ threadId, sourceRunId: runId }).pipe(
+      Effect.provide(
+        Layer.merge(
+          ServerSettings.layerTest({ continueThreadsAfterServerUpdate: false }),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: () => Effect.succeed(projection),
+            recoverDelegatedTask: () => Effect.void,
+            dispatch: (command) => {
+              commands.push(command);
+              return Effect.succeed({} as never);
+            },
+          }),
+        ),
+      ),
+    );
+    assert.lengthOf(commands, 1);
+    assert.deepEqual(
+      (commands[0] as { restartContinuationOfRunId: unknown }).restartContinuationOfRunId,
+      runId,
     );
   }),
 );
