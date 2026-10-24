@@ -85,6 +85,7 @@ const isPreparation = Schema.is(
   Schema.Struct({ requestId: Schema.String, expectedGeneration: Schema.optional(Schema.String) }),
 );
 const supportsSessionPreparation = process.env.T3_ACP_SESSION_PREPARATION === "1";
+const rejectPreparedPrompt = process.env.T3_ACP_REJECT_PREPARED_PROMPT === "1";
 let preparedRequestId: string | undefined;
 const failLoadSession = process.env.T3_ACP_FAIL_LOAD_SESSION === "1";
 const failLoadSessionAfterConfigReplay =
@@ -901,6 +902,12 @@ const program = Effect.gen(function* () {
   yield* agent.handlePrompt((request) =>
     Effect.gen(function* () {
       const requestedSessionId = String(request.sessionId ?? sessionId);
+      if (rejectPreparedPrompt && request._meta?.["t3code.sessionPreparation"] !== undefined)
+        return yield* new AcpError.AcpRequestError({
+          code: -32097,
+          errorMessage: "Mock preparation rejected before dispatch",
+          data: { kind: "session_preparation", dispatch: "rejected" },
+        });
       if (supportsSessionPreparation && preparedRequestId !== undefined) {
         const preparation = request._meta?.["t3code.sessionPreparation"];
         if (

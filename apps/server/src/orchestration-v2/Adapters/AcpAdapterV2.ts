@@ -104,6 +104,7 @@ import {
   ACP_SESSION_PREPARATION,
   decodeSessionPreparation,
   supportsSessionPreparation,
+  sessionPreparationRejected,
 } from "../../provider/acp/AcpSessionPreparation.ts";
 import {
   t3AcpPromptWithInstructions,
@@ -1492,6 +1493,11 @@ export function makeAcpAdapterV2(
     planSelectionTransition: (input) => Effect.succeed(acpSelectionTransition(input)),
     openSession: Effect.fn("AcpAdapterV2.openSession")(
       function* (input: ProviderAdapter.ProviderAdapterV2OpenSessionInput) {
+        if (input.retainedNativeThreadRequired && input.initialNativeThreadId === undefined)
+          return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            driver,
+            detail: "Retained dispatch reattachment requires its existing native session",
+          });
         const sessionScope = yield* Effect.scope;
         // Persisted ACP threads from before item identity v2 retain their old
         // deterministic ids. Fresh threads scope native ids by instance so
@@ -6257,6 +6263,7 @@ export function makeAcpAdapterV2(
                 "method" in initialStart.failure ? initialStart.failure.method : undefined;
               if (
                 input.preparationRequestId !== undefined ||
+                input.retainedNativeThreadRequired === true ||
                 input.initialNativeThreadId === undefined ||
                 acpDurableSessionUnavailable(initialStart.failure) ||
                 (failedMethod !== "session/load" && failedMethod !== "session/resume")
@@ -6277,6 +6284,11 @@ export function makeAcpAdapterV2(
         rememberTerminalEnvironment(started.sessionId, input.threadId);
         const capabilities = negotiatedCapabilities(flavor.capabilities, started);
         const durablePrompts = supportsAcpDurablePrompt(started.initializeResult._meta);
+        if (input.retainedNativeThreadRequired && !durablePrompts)
+          return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            driver,
+            detail: "Retained dispatch reattachment requires durable prompt support",
+          });
         const canLoadSession = started.initializeResult.agentCapabilities?.loadSession === true;
         const canResumeSession =
           started.initializeResult.agentCapabilities?.sessionCapabilities?.resume != null;
@@ -7274,6 +7286,7 @@ export function makeAcpAdapterV2(
                     },
                   }),
             };
+            yield* turnInput.preparationLifecycle?.beforePrompt() ?? Effect.void;
             if (prepared !== undefined && preparedBinding !== undefined) {
               // End the inspection window at genuine turn admission. The captured
               // payload still checks request/generation atomically at the controller.
@@ -7281,6 +7294,7 @@ export function makeAcpAdapterV2(
               preparedRetainedSession = false;
             }
             yield* runtime.prompt(promptPayload).pipe(
+              Effect.tap(() => turnInput.preparationLifecycle?.result("completed") ?? Effect.void),
               Effect.tap(() =>
                 Ref.update(promptInstructionStates, (current) => {
                   if (promptParts?.instructionState === undefined) return current;
@@ -7336,6 +7350,8 @@ export function makeAcpAdapterV2(
                   Effect.gen(function* () {
                     // An uncertain prompt cannot reuse preparation for another attempt.
                     if (prepared !== undefined) {
+                      if (sessionPreparationRejected(Cause.squash(cause)))
+                        yield* turnInput.preparationLifecycle?.result("rejected") ?? Effect.void;
                       preparedBinding = undefined;
                       preparedRetainedSession = !context.interrupted;
                     }
@@ -7924,6 +7940,7 @@ export function makeAcpAdapterV2(
                           detail: `ACP provider turn ${turnInput.providerTurnId} did not acknowledge cancellation before the interrupt timeout`,
                         });
                       }
+                      yield* context.input.preparationLifecycle?.result("completed") ?? Effect.void;
                     });
                     if (!hardRestart) {
                       return yield* restore(runTransition);

@@ -8,6 +8,7 @@ import {
   OrchestrationV2RuntimeRequest,
   ProviderInstanceId,
   ProviderSessionId,
+  type RunId,
   ThreadId,
   type ProviderThreadId,
   PrepareProviderSessionError,
@@ -58,6 +59,7 @@ import {
   type ProviderAdapterV2Event,
   type ProviderAdapterV2EventSubscription,
   type ProviderAdapterV2SessionRuntime,
+  type ProviderAdapterV2TurnInput,
 } from "./ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -79,7 +81,10 @@ const isPrepareProviderSessionError = Schema.is(PrepareProviderSessionError);
 export const requiresLivePreparation = (
   marker: ProviderSessionPreparation | undefined,
 ): marker is ProviderSessionPreparation =>
-  marker !== undefined && marker.failure === undefined && marker.consumedByRunId === undefined;
+  marker !== undefined &&
+  (marker.dispatchingRunId !== undefined ||
+    ((marker.failure === undefined || marker.holdRequired === true) &&
+      marker.consumedByRunId === undefined));
 
 export const ProviderSessionReleaseReason = Schema.Literals([
   "idle_timeout",
@@ -185,6 +190,7 @@ export interface ProviderSessionManagerV2Shape {
     readonly initialProviderItemIdentityVersion?: 2;
     readonly preparationRequestId?: string;
     readonly sessionPreparation?: ProviderSessionPreparation;
+    readonly restartContinuationOfRunId?: RunId;
   }) => Effect.Effect<ProviderAdapterV2SessionRuntime, ProviderSessionManagerV2Error>;
   readonly get: (
     providerSessionId: ProviderSessionId,
@@ -394,6 +400,32 @@ export const layerWithOptions = (
           readonly credentialId: string | undefined;
         }
       >();
+      const pendingPreparationIsCurrent = (
+        marker: ProviderSessionPreparation,
+        originalRunId: RunId | undefined,
+      ) =>
+        Effect.gen(function* () {
+          if (
+            marker.dispatchingRunId === undefined ||
+            originalRunId === undefined ||
+            marker.dispatchingRunId !== originalRunId
+          )
+            return false;
+          const current = yield* projectionStore.getThreadRecords(marker.threadId, [
+            "providerThreads",
+          ]);
+          const bound = current.providerThreads.find(
+            (thread) => thread.id === marker.providerThreadId,
+          );
+          return (
+            current.thread.sessionPreparation?.requestId === marker.requestId &&
+            current.thread.sessionPreparation.dispatchingRunId === originalRunId &&
+            current.thread.activeProviderThreadId === marker.providerThreadId &&
+            bound?.appThreadId === marker.threadId &&
+            bound.providerSessionId === marker.providerSessionId &&
+            bound.nativeThreadRef?.nativeId === marker.nativeId
+          );
+        }).pipe(Effect.catch(() => Effect.succeed(false)));
       const preparationIsLive = (input: ProviderSessionPreparation) => {
         const invalidate = () =>
           Effect.gen(function* () {
@@ -431,6 +463,7 @@ export const layerWithOptions = (
             current.thread.sessionPreparation.receipt?.attachmentId !==
               input.receipt.attachmentId ||
             current.thread.sessionPreparation.consumedByRunId !== undefined ||
+            current.thread.sessionPreparation.dispatchingRunId !== undefined ||
             bound?.providerSessionId !== input.providerSessionId ||
             bound.nativeThreadRef?.nativeId !== input.nativeId ||
             bound.appThreadId !== input.threadId
@@ -1815,6 +1848,96 @@ export const layerWithOptions = (
       ): ProviderAdapterV2SessionRuntime => {
         const providerSessionId = runtime.providerSessionId;
         const subscribeEvents = makeEventSubscription(eventSubscribers);
+        const preparationTransition = (
+          input: ProviderAdapterV2TurnInput,
+          transition: "validate" | "dispatch" | "completed" | "rejected",
+        ) =>
+          threadCommands.withLock(
+            input.threadId,
+            Effect.gen(function* () {
+              const expected = input.appThread.sessionPreparation;
+              const records = yield* projectionStore.getThreadRecords(input.threadId, []);
+              const marker = records.thread.sessionPreparation;
+              const fail = () =>
+                new ProviderAdapterTurnStartError({
+                  driver: runtime.driver,
+                  threadId: input.threadId,
+                  providerThreadId: input.providerThread.id,
+                  runId: input.runId,
+                  cause: "Retained session preparation expired; prepare again before continuing.",
+                });
+              if (expected === undefined || marker?.requestId !== expected.requestId) {
+                if (transition === "completed" || transition === "rejected") return;
+                return yield* fail();
+              }
+              if (
+                marker.providerThreadId !== input.providerThread.id ||
+                marker.providerSessionId !== providerSessionId ||
+                marker.nativeId !== input.providerThread.nativeThreadRef?.nativeId
+              )
+                return yield* fail();
+              const reattach = yield* pendingPreparationIsCurrent(
+                marker,
+                input.restartContinuationOfRunId,
+              );
+              if (transition === "validate" || transition === "dispatch") {
+                if (!reattach && !(yield* preparationIsLive(expected))) return yield* fail();
+                if (transition === "validate" || reattach) return;
+              } else if (
+                (marker.dispatchingRunId ?? marker.consumedByRunId) !== input.runId &&
+                (marker.dispatchingRunId ?? marker.consumedByRunId) !==
+                  input.restartContinuationOfRunId
+              ) {
+                return yield* fail();
+              }
+              let next: ProviderSessionPreparation;
+              if (transition === "dispatch") {
+                next = { ...marker, dispatchingRunId: input.runId };
+              } else if (transition === "rejected") {
+                // Only a protocol acknowledgement proving rejection may retire
+                // uncertain delivery. A new request must obtain a fresh receipt.
+                const {
+                  consumedByRunId: _run,
+                  dispatchingRunId: _pending,
+                  receipt: _receipt,
+                  ...retry
+                } = marker;
+                next = retry;
+              } else {
+                if (marker.dispatchingRunId === undefined) return;
+                const { dispatchingRunId: _pending, holdRequired: _hold, ...settled } = marker;
+                next = { ...settled, consumedByRunId: marker.dispatchingRunId };
+              }
+              yield* eventSink.write({
+                events: [
+                  {
+                    id: yield* idAllocator.allocate.event({ threadId: input.threadId }),
+                    threadId: input.threadId,
+                    type: "thread.metadata-updated",
+                    occurredAt: yield* DateTime.now,
+                    payload: { ...records.thread, sessionPreparation: next },
+                  },
+                ],
+              });
+              if (transition !== "dispatch") {
+                if (preparations.get(input.threadId)?.receipt.requestId === marker.requestId)
+                  preparations.delete(input.threadId);
+                dropPreparationReservation(input.threadId, providerSessionId);
+              }
+            }).pipe(
+              Effect.mapError((cause) =>
+                isProviderAdapterTurnStartError(cause)
+                  ? cause
+                  : new ProviderAdapterTurnStartError({
+                      driver: runtime.driver,
+                      threadId: input.threadId,
+                      providerThreadId: input.providerThread.id,
+                      runId: input.runId,
+                      cause,
+                    }),
+              ),
+            ),
+          );
         // Every provider's turn operations pass through here, so this is where they are
         // counted. Only turn starts are timed: until the provider accepts the turn.
         const turnMetrics = (operation: string, model?: string) =>
@@ -1934,52 +2057,7 @@ export const layerWithOptions = (
           startTurn: (input) =>
             (!requiresLivePreparation(input.appThread.sessionPreparation)
               ? Effect.void
-              : threadCommands.withLock(
-                  input.threadId,
-                  Effect.gen(function* () {
-                    const marker = input.appThread.sessionPreparation!;
-                    if (!(yield* preparationIsLive(marker))) {
-                      return yield* new ProviderAdapterTurnStartError({
-                        driver: runtime.driver,
-                        threadId: input.threadId,
-                        providerThreadId: input.providerThread.id,
-                        runId: input.runId,
-                        cause:
-                          "Retained session preparation expired; prepare again before continuing.",
-                      });
-                    }
-                    const records = yield* projectionStore.getThreadRecords(input.threadId, []);
-                    // Persist admission before the adapter can dispatch. Recovery
-                    // may then attach to this run without demanding idle preparation
-                    // while the same accepted native work is still running.
-                    yield* eventSink.write({
-                      events: [
-                        {
-                          id: yield* idAllocator.allocate.event({ threadId: input.threadId }),
-                          threadId: input.threadId,
-                          type: "thread.metadata-updated",
-                          occurredAt: yield* DateTime.now,
-                          payload: {
-                            ...records.thread,
-                            sessionPreparation: { ...marker, consumedByRunId: input.runId },
-                          },
-                        },
-                      ],
-                    });
-                  }).pipe(
-                    Effect.mapError((cause) =>
-                      isProviderAdapterTurnStartError(cause)
-                        ? cause
-                        : new ProviderAdapterTurnStartError({
-                            driver: runtime.driver,
-                            threadId: input.threadId,
-                            providerThreadId: input.providerThread.id,
-                            runId: input.runId,
-                            cause,
-                          }),
-                    ),
-                  ),
-                )
+              : preparationTransition(input, "validate")
             ).pipe(
               Effect.andThen(
                 observeActivity(
@@ -2012,20 +2090,33 @@ export const layerWithOptions = (
                         ),
                       ),
                       () =>
-                        runtime.startTurn(input).pipe(
-                          Effect.tap(() =>
-                            Effect.sync(() =>
-                              dropPreparationReservation(input.threadId, providerSessionId),
+                        runtime
+                          .startTurn({
+                            ...input,
+                            ...(!requiresLivePreparation(input.appThread.sessionPreparation)
+                              ? {}
+                              : {
+                                  preparationLifecycle: {
+                                    beforePrompt: () => preparationTransition(input, "dispatch"),
+                                    result: (outcome: "completed" | "rejected") =>
+                                      preparationTransition(input, outcome),
+                                  },
+                                }),
+                          })
+                          .pipe(
+                            Effect.tap(() =>
+                              Effect.sync(() =>
+                                dropPreparationReservation(input.threadId, providerSessionId),
+                              ),
                             ),
+                            Effect.onError(() =>
+                              Effect.sync(() => {
+                                preparations.delete(input.threadId);
+                                dropPreparationReservation(input.threadId, providerSessionId);
+                              }),
+                            ),
+                            turnMetrics("send", input.modelSelection.model),
                           ),
-                          Effect.onError(() =>
-                            Effect.sync(() => {
-                              preparations.delete(input.threadId);
-                              dropPreparationReservation(input.threadId, providerSessionId);
-                            }),
-                          ),
-                          turnMetrics("send", input.modelSelection.model),
-                        ),
                       (_, exit) =>
                         Exit.isFailure(exit)
                           ? observeActivity(
@@ -2248,9 +2339,10 @@ export const layerWithOptions = (
                 );
                 const latest = records.runs.at(-1);
                 const marker = current.thread.sessionPreparation;
+                if (marker?.dispatchingRunId !== undefined) return yield* fail("owner_busy");
                 const completed = records.runs.find((run) => run.id === input.completedRunId);
                 // An expired hold can reject an app run before dispatch. Every
-                // genuine admission first retires the marker durably, so an
+                // native dispatch first records its run durably, so an
                 // unconsumed marker proves these later failed runs sent no prompt.
                 const rejectedBeforeAdmission =
                   requiresLivePreparation(marker) &&
@@ -2341,7 +2433,13 @@ export const layerWithOptions = (
                 thread: current.thread,
                 modelSelection: latest.modelSelection,
               });
-              const pending: ProviderSessionPreparation = { ...input };
+              const pending: ProviderSessionPreparation = {
+                ...input,
+                ...(requiresLivePreparation(marker) &&
+                (marker.receipt !== undefined || marker.holdRequired === true)
+                  ? { holdRequired: true as const }
+                  : {}),
+              };
               const now = yield* DateTime.now;
               const event = {
                 id: yield* idAllocator.allocate.event({ threadId: input.threadId }),
@@ -2421,7 +2519,7 @@ export const layerWithOptions = (
                       id: yield* idAllocator.allocate.event({ threadId: input.threadId }),
                       payload: {
                         ...fresh.current.thread,
-                        sessionPreparation: { ...input, receipt },
+                        sessionPreparation: { ...input, receipt, holdRequired: true },
                       },
                     },
                   ],
@@ -2513,7 +2611,12 @@ export const layerWithOptions = (
                 requiresLivePreparation(input.sessionPreparation) &&
                 (input.providerSessionId !== input.sessionPreparation.providerSessionId ||
                   input.threadId !== input.sessionPreparation.threadId ||
-                  !(yield* preparationIsLive(input.sessionPreparation)))
+                  !(input.sessionPreparation.dispatchingRunId !== undefined
+                    ? yield* pendingPreparationIsCurrent(
+                        input.sessionPreparation,
+                        input.restartContinuationOfRunId,
+                      )
+                    : yield* preparationIsLive(input.sessionPreparation)))
               ) {
                 return yield* new PrepareProviderSessionError({
                   threadId: input.threadId,
@@ -2603,6 +2706,9 @@ export const layerWithOptions = (
                     : {
                         preparationRequestId: input.preparationRequestId,
                       }),
+                  ...(input.sessionPreparation?.dispatchingRunId !== undefined
+                    ? { retainedNativeThreadRequired: true }
+                    : {}),
                   ...(input.resumeFromSession === undefined
                     ? {}
                     : { resumeFromSession: input.resumeFromSession }),

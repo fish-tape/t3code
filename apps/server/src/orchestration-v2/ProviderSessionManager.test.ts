@@ -318,6 +318,8 @@ function makeProviderAdapter(
     readonly preparation?: {
       readonly calls: Ref.Ref<number>;
       readonly fail?: boolean;
+      readonly failAfterCalls?: number;
+      readonly turnOutcome?: "before_dispatch_failure" | "rejected" | "uncertain" | "pending";
     };
     readonly failEventStream?: boolean;
     readonly capabilities?: OrchestrationV2ProviderCapabilities;
@@ -431,8 +433,10 @@ function makeProviderAdapter(
                   providerThread,
                 }: Parameters<NonNullable<ProviderAdapterV2SessionRuntime["prepareThread"]>>[0]) =>
                   Ref.update(options.preparation!.calls, (n) => n + 1).pipe(
-                    Effect.andThen(
-                      options.preparation!.fail
+                    Effect.andThen(Ref.get(options.preparation!.calls)),
+                    Effect.flatMap((count) =>
+                      options.preparation!.fail ||
+                      count > (options.preparation!.failAfterCalls ?? Infinity)
                         ? unimplemented("private fake preparation failure")
                         : Effect.succeed({
                             sessionId: providerThread.nativeThreadRef!.nativeId!,
@@ -450,11 +454,30 @@ function makeProviderAdapter(
               ...current,
               resumeCount: current.resumeCount + 1,
             })).pipe(Effect.as(threadInput.providerThread)),
-          startTurn: () =>
+          startTurn: (turnInput) =>
             Ref.update(state, (current) => ({
               ...current,
               startCount: current.startCount + 1,
-            })).pipe(Effect.andThen(options.startTurn ?? Effect.void)),
+            })).pipe(
+              Effect.andThen(options.startTurn ?? Effect.void),
+              Effect.andThen(
+                Effect.gen(function* () {
+                  if (options.preparation?.turnOutcome === "before_dispatch_failure")
+                    return yield* unimplemented("Fake pre-prompt validation failed");
+                  yield* turnInput.preparationLifecycle?.beforePrompt() ?? Effect.void;
+                  if (options.preparation?.turnOutcome === "uncertain")
+                    return yield* unimplemented("Fake transport outcome is uncertain");
+                  if (options.preparation?.turnOutcome === "pending") return;
+                  yield* (
+                    turnInput.preparationLifecycle?.result(
+                      options.preparation?.turnOutcome === "rejected" ? "rejected" : "completed",
+                    ) ?? Effect.void
+                  );
+                  if (options.preparation?.turnOutcome === "rejected")
+                    return yield* unimplemented("Fake controller certified rejection");
+                }),
+              ),
+            ),
           steerTurn: () => Effect.void,
           interruptTurn: () =>
             Ref.update(state, (current) => ({
@@ -4639,14 +4662,14 @@ const seedPreparation = Effect.gen(function* () {
   const ids = yield* IdAllocator.IdAllocatorV2;
   const sink = yield* EventSink.EventSinkV2;
   const now = yield* DateTime.now;
-  const threadId = ThreadId.make("retained-preparation-thread");
+  const threadId = yield* ids.allocate.thread({ fixtureName: "retained-preparation" });
   const providerSessionId = yield* ids.allocate.providerSession({
     threadId,
     providerInstanceId: modelSelection.instanceId,
   });
   const created = yield* makeThreadCreatedEvent({ idAllocator: ids, threadId, now });
   const providerThread = makeProviderThread({ idAllocator: ids, threadId, providerSessionId, now });
-  const completedRunId = RunId.make("retained-completed-run");
+  const completedRunId = RunId.make(`${threadId}:completed`);
   const run = {
     id: completedRunId,
     threadId,
@@ -4707,7 +4730,12 @@ function preparationCase<A, E, R>(
     state: Ref.Ref<TestProviderRuntimeState>,
     calls: Ref.Ref<number>,
   ) => Effect.Effect<A, E, R>,
-  options: { unsupported?: boolean; fail?: boolean } = {},
+  options: {
+    unsupported?: boolean;
+    fail?: boolean;
+    failAfterCalls?: number;
+    turnOutcome?: "before_dispatch_failure" | "rejected" | "uncertain" | "pending";
+  } = {},
 ) {
   return Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
@@ -4725,6 +4753,12 @@ function preparationCase<A, E, R>(
                 preparation: {
                   calls,
                   ...(options.fail === undefined ? {} : { fail: options.fail }),
+                  ...(options.failAfterCalls === undefined
+                    ? {}
+                    : { failAfterCalls: options.failAfterCalls }),
+                  ...(options.turnOutcome === undefined
+                    ? {}
+                    : { turnOutcome: options.turnOutcome }),
                 },
               }),
         }),
@@ -4927,7 +4961,7 @@ const preparationTurn = (
 ) =>
   Effect.gen(function* () {
     const ids = yield* IdAllocator.IdAllocatorV2;
-    const runId = RunId.make("next-genuine-run");
+    const runId = RunId.make(`${seed.input.threadId}:genuine`);
     return {
       appThread: thread,
       threadId: seed.input.threadId,
@@ -4971,6 +5005,154 @@ it.effect("preparation detach prevents a stale turn from reaching the adapter", 
   ),
 );
 
+const recordFailedPreparationRun = (seed: Effect.Success<typeof seedPreparation>) =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const ids = yield* IdAllocator.IdAllocatorV2;
+    const runId = RunId.make(`${seed.input.threadId}:genuine`);
+    yield* sink.write({
+      events: [
+        {
+          id: yield* ids.allocate.event({ threadId: seed.input.threadId }),
+          threadId: seed.input.threadId,
+          occurredAt: seed.now,
+          type: "run.created",
+          payload: {
+            ...seed.run,
+            id: runId,
+            ordinal: 2,
+            status: "failed",
+            rootNodeId: ids.derive.rootNode({ runId }),
+            activeAttemptId: ids.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+          },
+        },
+      ],
+    });
+  });
+
+it.effect.each(["before_dispatch_failure", "rejected"] as const)(
+  "preparation can refresh after a certain %s without native acceptance",
+  (turnOutcome) =>
+    preparationCase(
+      (seed, _state, calls) =>
+        Effect.gen(function* () {
+          const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+          const store = yield* ProjectionStore.ProjectionStoreV2;
+          yield* manager.prepare(seed.input);
+          const thread = (yield* store.getThreadRecords(seed.input.threadId, [])).thread;
+          const runtime = Option.getOrThrow(yield* manager.get(seed.input.providerSessionId));
+          assert.isTrue(
+            Exit.isFailure(
+              yield* runtime.startTurn(yield* preparationTurn(seed, thread)).pipe(Effect.exit),
+            ),
+          );
+          const after = (yield* store.getThreadRecords(seed.input.threadId, [])).thread;
+          assert.isUndefined(after.sessionPreparation?.consumedByRunId);
+          assert.isUndefined(after.sessionPreparation?.dispatchingRunId);
+          yield* recordFailedPreparationRun(seed);
+          const fresh = yield* manager.prepare({
+            ...seed.input,
+            requestId: CommandId.make(`${seed.input.threadId}:refresh`),
+          });
+          assert.equal(fresh.nativeSession.sessionId, seed.input.nativeId);
+          assert.equal(yield* Ref.get(calls), 2);
+        }),
+      { turnOutcome },
+    ),
+);
+
+it.effect(
+  "preparation preserves an uncertain dispatch hold across release and permits only its reattachment",
+  () =>
+    preparationCase(
+      (seed, state) =>
+        Effect.gen(function* () {
+          const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+          const store = yield* ProjectionStore.ProjectionStoreV2;
+          yield* manager.prepare(seed.input);
+          const thread = (yield* store.getThreadRecords(seed.input.threadId, [])).thread;
+          const runtime = Option.getOrThrow(yield* manager.get(seed.input.providerSessionId));
+          yield* runtime.startTurn(yield* preparationTurn(seed, thread)).pipe(Effect.exit);
+          yield* recordFailedPreparationRun(seed);
+          yield* manager.release({
+            providerSessionId: seed.input.providerSessionId,
+            reason: "server_shutdown",
+          });
+          const after = (yield* store.getThreadRecords(seed.input.threadId, [])).thread;
+          assert.equal(
+            after.sessionPreparation?.dispatchingRunId,
+            `${seed.input.threadId}:genuine`,
+          );
+          const open = {
+            threadId: seed.input.threadId,
+            providerSessionId: seed.input.providerSessionId,
+            modelSelection,
+            runtimePolicy,
+            initialNativeThreadId: seed.input.nativeId,
+            sessionPreparation: after.sessionPreparation!,
+          };
+          assert.isTrue(Exit.isFailure(yield* manager.open(open).pipe(Effect.exit)));
+          assert.equal((yield* Ref.get(state)).openCount, 1);
+          const fresh = yield* manager
+            .prepare({
+              ...seed.input,
+              requestId: CommandId.make(`${seed.input.threadId}:unsafe-refresh`),
+            })
+            .pipe(Effect.flip);
+          assert.equal(fresh.reason, "owner_busy");
+          yield* manager.open({
+            ...open,
+            restartContinuationOfRunId: RunId.make(`${seed.input.threadId}:genuine`),
+          });
+          assert.equal((yield* Ref.get(state)).openCount, 2);
+        }),
+      { turnOutcome: "uncertain" },
+    ),
+);
+
+it.effect("preparation retains an established hold when its fresh refresh fails", () =>
+  preparationCase(
+    (seed) =>
+      Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        yield* manager.prepare(seed.input);
+        const thread = (yield* store.getThreadRecords(seed.input.threadId, [])).thread;
+        const runtime = Option.getOrThrow(yield* manager.get(seed.input.providerSessionId));
+        yield* runtime.startTurn(yield* preparationTurn(seed, thread)).pipe(Effect.exit);
+        yield* recordFailedPreparationRun(seed);
+        yield* manager
+          .prepare({
+            ...seed.input,
+            requestId: CommandId.make(`${seed.input.threadId}:failed-refresh`),
+          })
+          .pipe(Effect.exit);
+        const after = (yield* store.getThreadRecords(seed.input.threadId, [])).thread;
+        assert.equal(after.sessionPreparation?.failure, "attachment_failed");
+        assert.isTrue(after.sessionPreparation?.holdRequired);
+        yield* manager.release({
+          providerSessionId: seed.input.providerSessionId,
+          reason: "server_shutdown",
+        });
+        assert.isTrue(
+          Exit.isFailure(
+            yield* manager
+              .open({
+                threadId: seed.input.threadId,
+                providerSessionId: seed.input.providerSessionId,
+                modelSelection,
+                runtimePolicy,
+                initialNativeThreadId: seed.input.nativeId,
+                sessionPreparation: after.sessionPreparation!,
+              })
+              .pipe(Effect.exit),
+          ),
+        );
+      }),
+    { turnOutcome: "rejected", failAfterCalls: 1 },
+  ),
+);
+
 it.effect("preparation allows another turn after its admitted turn and idle release", () =>
   preparationCase((seed, state) =>
     Effect.gen(function* () {
@@ -5006,7 +5188,7 @@ it.effect("preparation allows another turn after its admitted turn and idle rele
       yield* TestClock.adjust("2 minutes");
       assert.isTrue(Option.isNone(yield* manager.get(seed.input.providerSessionId)));
       const after = (yield* store.getThreadRecords(seed.input.threadId, [])).thread;
-      assert.equal(after.sessionPreparation?.consumedByRunId, "next-genuine-run");
+      assert.equal(after.sessionPreparation?.consumedByRunId, `${seed.input.threadId}:genuine`);
       const reopened = yield* manager.open({
         threadId: seed.input.threadId,
         providerSessionId: seed.input.providerSessionId,

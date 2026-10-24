@@ -551,6 +551,10 @@ export const layer: Layer.Layer<
       const existingSessionProjection = projection.providerSessions.find(
         (candidate) => candidate.id === providerSessionId,
       );
+      const retainedContinuationSource =
+        run.restartContinuationOfRunId === undefined
+          ? undefined
+          : restartContinuationSourceRunId(run.restartContinuationOfRunId, projection.runs);
       const sessionResult = yield* Effect.result(
         providerSessions.open({
           threadId: projection.thread.id,
@@ -561,6 +565,11 @@ export const layer: Layer.Layer<
             ? {}
             : {
                 sessionPreparation: projection.thread.sessionPreparation,
+                ...(retainedContinuationSource === undefined
+                  ? {}
+                  : {
+                      restartContinuationOfRunId: retainedContinuationSource,
+                    }),
               }),
           ...(existingSessionProjection === undefined
             ? {}

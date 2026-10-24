@@ -377,6 +377,8 @@ export type ProviderAdapterV2Error = typeof ProviderAdapterV2Error.Type;
 export interface ProviderAdapterV2OpenSessionInput {
   /** Strict existing-session attachment: no fresh native fallback is permitted. */
   readonly preparationRequestId?: string;
+  /** Retain an uncertain operation across transport replacement without native fallback. */
+  readonly retainedNativeThreadRequired?: boolean;
   readonly threadId: ThreadId;
   readonly providerSessionId: ProviderSessionId;
   readonly modelSelection: ModelSelection;
@@ -405,6 +407,13 @@ export interface ProviderAdapterV2TurnInput {
   readonly nativeThreadHasTurns?: boolean;
   readonly providerTurnOrdinal: number;
   readonly restartContinuationOfRunId?: RunId;
+  /** Manager-owned durable preparation transitions at the actual native RPC boundary. */
+  readonly preparationLifecycle?: {
+    readonly beforePrompt: () => Effect.Effect<void, ProviderAdapterTurnStartError>;
+    readonly result: (
+      outcome: "completed" | "rejected",
+    ) => Effect.Effect<void, ProviderAdapterTurnStartError>;
+  };
   readonly attemptId: RunAttemptId;
   readonly rootNodeId: NodeId;
   readonly providerThread: OrchestrationV2ProviderThread;

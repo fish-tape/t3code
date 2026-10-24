@@ -399,8 +399,12 @@ export const ProviderSessionPreparation = Schema.Struct({
   ...PrepareProviderSessionInput.fields,
   receipt: Schema.optional(ProviderSessionPreparationReceipt),
   failure: Schema.optional(SessionPreparationFailureReason),
-  /** Central admission retires the inspection hold before dispatching the genuine turn. */
+  /** A native result or confirmed Stop retired this operation's hold. */
   consumedByRunId: Schema.optional(RunId),
+  /** Until a native result, only reattachment to that same operation may proceed. */
+  dispatchingRunId: Schema.optional(RunId),
+  /** A failed refresh must retain a previously established inspection hold. */
+  holdRequired: Schema.optional(Schema.Literal(true)),
 });
 export type ProviderSessionPreparation = typeof ProviderSessionPreparation.Type;
 

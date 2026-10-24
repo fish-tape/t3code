@@ -99,15 +99,20 @@ Preparation reserves the attachment for inspection without keeping it alive thro
 synthetic prompts. The reservation ends when a genuine turn is accepted or the
 operator uses normal detach/release. That next turn carries the same request and
 expected generation. Both T3 and the controller reject a stale marker before native
-dispatch. Central admission retires the hold durably before dispatch, so a restart
-can reattach to accepted work without demanding an idle preparation. Later turns
-and ordinary cleanup do not reuse that consumed marker. An uncertain native prompt
-remains held by the adapter. Before admission, detach, release, restart or any
-attachment/binding change invalidates readiness and requires fresh preparation.
-A failed preparation does not create a hold on an otherwise ordinary thread.
-Retrying a current request
-returns its receipt without reapplying the toolkit; an expired request cannot be
-replayed into a new attachment.
+dispatch. After local validation, T3 records dispatch intent immediately before the
+native RPC. A restart may reattach only to that original operation until a native
+result or confirmed Stop retires its hold. Uncertain delivery survives transport
+release and process restart; it cannot open an ordinary turn or a fresh native
+fallback. Pre-dispatch failure leaves preparation unused. A controller-certified
+rejection clears only dispatch intent and its stale receipt, allowing a fresh
+preparation request. Numeric error codes alone do not prove rejection.
+
+After settlement, later turns and ordinary cleanup do not reuse the consumed
+marker. Before dispatch, detach, release, restart or any attachment/binding change
+invalidates readiness and requires fresh preparation. An initial failed preparation
+does not hold an ordinary thread; a failed refresh preserves an established hold.
+Retrying a current request returns its receipt without reapplying the toolkit;
+an expired request cannot be replayed into a new attachment.
 
 A parked, absent, destroyed or uncertain worker stays held. Export, migrate and
 restore retained files/native history through a separately authorized lifecycle;

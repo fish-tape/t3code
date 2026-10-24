@@ -15,3 +15,25 @@ export const supportsSessionPreparation = Schema.is(
 export const decodeSessionPreparation = Schema.decodeUnknownOption(
   Schema.Struct({ [ACP_SESSION_PREPARATION]: NativeSessionPreparationReceipt }),
 );
+
+const isRejectedPrompt = Schema.is(
+  Schema.Struct({
+    code: Schema.Literal(-32097),
+    data: Schema.Struct({
+      kind: Schema.Literal("session_preparation"),
+      dispatch: Schema.Literal("rejected"),
+    }),
+  }),
+);
+
+/** A controller-certified pre-dispatch rejection; generic errors remain uncertain. */
+export function sessionPreparationRejected(error: unknown): boolean {
+  if (isRejectedPrompt(error)) return true;
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "cause" in error &&
+    error.cause !== error &&
+    sessionPreparationRejected(error.cause)
+  );
+}
