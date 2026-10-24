@@ -22,6 +22,7 @@ import {
   PullRequestOperationError,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
   RunId,
@@ -3142,6 +3143,139 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       assert.equal(first._tag, "OrchestratorProjectionError");
       assert.equal(retry._tag, "OrchestratorCommandPreviouslyRejectedError");
     }),
+  );
+
+  it.effect.each(["failed", "cancelled", "completed"] as const)(
+    "explicitly reattaches a held %s dispatch once through the normal command path",
+    (status) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const threadId = ThreadId.make(`held-dispatch-${status}`);
+        const projectId = ProjectId.make(`${threadId}:project`);
+        yield* seedProject({
+          projectId,
+          title: "Held dispatch",
+          workspaceRoot: "/tmp/held-dispatch",
+          defaultModelSelection: modelSelection,
+          createdAt: "2026-01-01T00:00:00.000Z",
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`${threadId}:create`),
+          threadId,
+          projectId,
+          title: "Held operation",
+          createdBy: "user",
+          creationSource: "web",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${threadId}:start`),
+          threadId,
+          messageId: MessageId.make(`${threadId}:start`),
+          text: "Original work",
+          attachments: [],
+          createdBy: "user",
+          creationSource: "web",
+          modelSelection,
+          dispatchMode: { type: "start_immediately" },
+        });
+        const projection = yield* orchestrator.getThreadProjection(threadId);
+        const original = projection.runs[0]!;
+        const now = yield* DateTime.now;
+        const providerThreadId = ProviderThreadId.make(`${threadId}:native`);
+        const providerSessionId = ProviderSessionId.make(`${threadId}:session`);
+        const driver = ProviderDriverKind.make("codex");
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`${threadId}:failed`),
+              type: "run.updated",
+              threadId,
+              runId: original.id,
+              occurredAt: now,
+              payload: { ...original, status, providerThreadId, completedAt: now },
+            },
+            {
+              id: EventId.make(`${threadId}:binding`),
+              type: "provider-thread.updated",
+              threadId,
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              occurredAt: now,
+              payload: {
+                id: providerThreadId,
+                driver,
+                providerInstanceId: modelSelection.instanceId,
+                providerSessionId,
+                appThreadId: threadId,
+                ownerNodeId: null,
+                nativeThreadRef: { driver, nativeId: "retained-native", strength: "strong" },
+                nativeConversationHeadRef: null,
+                status: "idle",
+                firstRunOrdinal: 1,
+                lastRunOrdinal: 1,
+                handoffIds: [],
+                forkedFrom: null,
+                createdAt: now,
+                updatedAt: now,
+              },
+            },
+            {
+              id: EventId.make(`${threadId}:hold`),
+              type: "thread.metadata-updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                ...projection.thread,
+                activeRunId: null,
+                activeProviderThreadId: providerThreadId,
+                sessionPreparation: {
+                  requestId: CommandId.make(`${threadId}:prepare`),
+                  threadId,
+                  providerThreadId,
+                  providerSessionId,
+                  nativeId: "retained-native",
+                  completedRunId: RunId.make(`${threadId}:prior-completed`),
+                  dispatchingRunId: original.id,
+                  holdRequired: true,
+                },
+              },
+            },
+          ],
+        });
+        const command = {
+          type: "message.dispatch" as const,
+          commandId: CommandId.make(`${threadId}:reattach`),
+          threadId,
+          messageId: MessageId.make(`${threadId}:reattach`),
+          text: "Reattach retained operation",
+          attachments: [],
+          createdBy: "user" as const,
+          creationSource: "mcp" as const,
+          dispatchMode: { type: "start_immediately" as const },
+          restartContinuationOfRunId: original.id,
+        };
+        yield* orchestrator.dispatch(command);
+        yield* orchestrator.dispatch(command);
+        const after = yield* orchestrator.getThreadProjection(threadId);
+        assert.lengthOf(after.runs, 2);
+        assert.equal(after.runs[1]?.restartContinuationOfRunId, original.id);
+        assert.equal(after.runs[1]?.providerThreadId, providerThreadId);
+        assert.equal(after.thread.sessionPreparation?.dispatchingRunId, original.id);
+        yield* orchestrator.dispatch({
+          ...command,
+          commandId: CommandId.make(`${threadId}:competing`),
+          messageId: MessageId.make(`${threadId}:competing`),
+        });
+        assert.lengthOf((yield* orchestrator.getThreadProjection(threadId)).runs, 2);
+      }),
   );
 
   it.effect(

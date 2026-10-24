@@ -6039,6 +6039,7 @@ export function makeAcpAdapterV2(
         });
 
         let preparedRetainedSession = input.preparationRequestId !== undefined;
+        let retainedDispatchAttachment = input.retainedNativeThreadRequired === true;
         let preparedBinding:
           | { requestId: string; sessionId: string; generation: string; consumed: boolean }
           | undefined;
@@ -6047,7 +6048,10 @@ export function makeAcpAdapterV2(
           threadId: ThreadId | null,
           resumeSessionId?: string,
         ) {
-          if (preparedRetainedSession && runtimeScope !== undefined) {
+          if (
+            (preparedRetainedSession || retainedDispatchAttachment) &&
+            runtimeScope !== undefined
+          ) {
             return yield* new EffectAcpErrors.AcpTransportError({
               cause: "preparation_invalidated",
               detail: "Prepared attachment changed; a new preparation is required",
@@ -6090,7 +6094,7 @@ export function makeAcpAdapterV2(
             replacement: AcpSessionRuntime.AcpSessionRuntimeStartResult,
           ) => Effect.Effect<void>,
         ) {
-          if (preparedRetainedSession)
+          if (preparedRetainedSession || retainedDispatchAttachment)
             return yield* new EffectAcpErrors.AcpTransportError({
               cause: "preparation_invalidated",
               detail: "Prepared attachment cannot be replaced",
@@ -6929,7 +6933,19 @@ export function makeAcpAdapterV2(
 
         const startTurnUnlocked = Effect.fn("AcpAdapterV2.startTurn")(
           function* (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) {
-            if (preparedRetainedSession) {
+            const marker = turnInput.appThread.sessionPreparation;
+            const retainedAttach =
+              marker?.dispatchingRunId !== undefined &&
+              marker.dispatchingRunId === turnInput.restartContinuationOfRunId &&
+              marker.providerThreadId === turnInput.providerThread.id &&
+              marker.providerSessionId === input.providerSessionId &&
+              marker.nativeId === turnInput.providerThread.nativeThreadRef?.nativeId;
+            if ((retainedAttach || turnInput.preparationLifecycle !== undefined) && !durablePrompts)
+              return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                driver,
+                detail: "Retained dispatch requires durable prompt support",
+              });
+            if (preparedRetainedSession && !retainedAttach) {
               const receipt = turnInput.appThread.sessionPreparation?.receipt;
               if (
                 preparedBinding === undefined ||
@@ -6952,6 +6968,7 @@ export function makeAcpAdapterV2(
                 detail: `ACP provider turn ${existing.providerTurnId} is still active`,
               });
             }
+            if (retainedAttach) retainedDispatchAttachment = true;
             useProviderThreadIdentity(turnInput.providerThread);
             // Session activation can itself invoke client fs/terminal methods.
             // Install the incoming thread policy before load/resume so those
@@ -7293,8 +7310,28 @@ export function makeAcpAdapterV2(
               preparedBinding.consumed = true;
               preparedRetainedSession = false;
             }
+            const settlePreparation = (outcome: "completed" | "rejected") =>
+              (turnInput.preparationLifecycle?.result(outcome) ?? Effect.void).pipe(
+                // Persistence failure keeps the durable hold. It must never
+                // replace a native result or skip terminal event delivery.
+                Effect.catchCause(() =>
+                  Effect.logWarning("orchestration-v2.preparation-settlement-failed", {
+                    driver,
+                    threadId: turnInput.threadId,
+                    runId: turnInput.runId,
+                    outcome,
+                  }),
+                ),
+              );
             yield* runtime.prompt(promptPayload).pipe(
-              Effect.tap(() => turnInput.preparationLifecycle?.result("completed") ?? Effect.void),
+              Effect.tap(() =>
+                Deferred.succeed(context.promptWireSettled, undefined).pipe(Effect.asVoid),
+              ),
+              Effect.tap(() => {
+                retainedDispatchAttachment = false;
+                preparedRetainedSession = false;
+                return settlePreparation("completed");
+              }),
               Effect.tap(() =>
                 Ref.update(promptInstructionStates, (current) => {
                   if (promptParts?.instructionState === undefined) return current;
@@ -7302,12 +7339,6 @@ export function makeAcpAdapterV2(
                   updated.set(requestedSessionId, promptParts.instructionState);
                   return updated;
                 }),
-              ),
-              // Wire settlement precedes the completion callback's permit request so
-              // settled-soft classification can observe the native return even when
-              // the completion fiber has not yet set promptSettled under the permit.
-              Effect.tap(() =>
-                Deferred.succeed(context.promptWireSettled, undefined).pipe(Effect.asVoid),
               ),
               Effect.flatMap((result) =>
                 runRuntimeCallbackAtGeneration(
@@ -7351,9 +7382,9 @@ export function makeAcpAdapterV2(
                     // An uncertain prompt cannot reuse preparation for another attempt.
                     if (prepared !== undefined) {
                       if (sessionPreparationRejected(Cause.squash(cause)))
-                        yield* turnInput.preparationLifecycle?.result("rejected") ?? Effect.void;
+                        yield* settlePreparation("rejected");
                       preparedBinding = undefined;
-                      preparedRetainedSession = !context.interrupted;
+                      preparedRetainedSession = true;
                     }
                     if (context.finalized) return;
                     yield* finalizeTurn(
@@ -7411,7 +7442,7 @@ export function makeAcpAdapterV2(
               }),
             );
             const requests = [...(yield* Ref.get(pendingRuntimeRequests)).values()];
-            if (!preparedRetainedSession) {
+            if (!preparedRetainedSession && !retainedDispatchAttachment) {
               yield* Effect.forEach(
                 requests,
                 (request) =>
@@ -7435,7 +7466,11 @@ export function makeAcpAdapterV2(
             const sessionCapabilities =
               started.initializeResult.agentCapabilities?.sessionCapabilities;
             // Release the local transport, retaining native work and pending permissions.
-            if (!preparedRetainedSession && sessionCapabilities?.close != null) {
+            if (
+              !preparedRetainedSession &&
+              !retainedDispatchAttachment &&
+              sessionCapabilities?.close != null
+            ) {
               yield* runtimeTransitionPermit.withPermitsIfAvailable(1)(
                 Effect.gen(function* () {
                   const teardownState = yield* Ref.get(runtimeTeardownState);
@@ -7940,7 +7975,9 @@ export function makeAcpAdapterV2(
                           detail: `ACP provider turn ${turnInput.providerTurnId} did not acknowledge cancellation before the interrupt timeout`,
                         });
                       }
-                      yield* context.input.preparationLifecycle?.result("completed") ?? Effect.void;
+                      // Local finalization (including transport loss after cancel)
+                      // does not prove the remote operation stopped. Only the
+                      // native prompt's successful return settles its durable hold.
                     });
                     if (!hardRestart) {
                       return yield* restore(runTransition);

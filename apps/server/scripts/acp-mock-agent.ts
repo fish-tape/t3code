@@ -496,7 +496,12 @@ const program = Effect.gen(function* () {
         info: { name: "t3-acp-mock-agent", version: "0.0.0" },
         _meta: {
           modelState: modelState(),
-          ...(supportsSessionPreparation ? { "t3code.sessionPreparation": 1 } : {}),
+          ...(supportsSessionPreparation
+            ? {
+                "t3code.sessionPreparation": 1,
+                "io.t3code/durable-prompt": { version: 1 },
+              }
+            : {}),
         },
         capabilities: {
           session: {

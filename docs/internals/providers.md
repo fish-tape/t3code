@@ -101,11 +101,27 @@ operator uses normal detach/release. That next turn carries the same request and
 expected generation. Both T3 and the controller reject a stale marker before native
 dispatch. After local validation, T3 records dispatch intent immediately before the
 native RPC. A restart may reattach only to that original operation until a native
-result or confirmed Stop retires its hold. Uncertain delivery survives transport
+result (including native cancellation) retires its hold. Local Stop finalization
+does not prove remote cancellation. Uncertain delivery survives transport
 release and process restart; it cannot open an ordinary turn or a fresh native
 fallback. Pre-dispatch failure leaves preparation unused. A controller-certified
 rejection clears only dispatch intent and its stale receipt, allowing a fresh
 preparation request. Numeric error codes alone do not prove rejection.
+
+For an uncertain dispatch or a result whose settlement could not persist, an
+authorized operator can explicitly reattach through the existing authenticated
+`orchestration.dispatchCommand` RPC: submit `message.dispatch` with a stable new
+`commandId`/`messageId`, the same `threadId`, `creationSource: "mcp"`, no attachments,
+`dispatchMode: { type: "start_immediately" }`, and
+`restartContinuationOfRunId` equal to the persisted `sessionPreparation.dispatchingRunId`.
+The text labels the recovery in the app; durable ACP sends an attach for the
+original operation, never that text as a new native prompt. This also handles a
+failed app run and a crash before the provider's running event committed. Exact
+current strong binding, no pending requests or competing work are required.
+Later messages rejected by this hold do not hide its original operation. Unknown
+or unavailable retained outcomes remain held; there is no blind replay or database
+edit procedure. A stopped run is reattached only by this explicit command;
+automatic restart deliveries keep their Stop exclusions.
 
 After settlement, later turns and ordinary cleanup do not reuse the consumed
 marker. Before dispatch, detach, release, restart or any attachment/binding change

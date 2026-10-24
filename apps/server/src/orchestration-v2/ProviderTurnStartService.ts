@@ -1002,12 +1002,19 @@ export const layer: Layer.Layer<
       });
       // Delivered once: this run's provider turn marks the work as told. A
       // restart continuation is prompted by its own text or resumes natively.
-      const noteContinuation = isRestartNoteContinuation(
-        run,
-        projection.runs,
-        projection.providerTurns,
-        projection.attempts,
-      );
+      const reattachingHeldDispatch =
+        retainedContinuationSource !== undefined &&
+        projection.thread.sessionPreparation?.dispatchingRunId === retainedContinuationSource;
+      // A retained operation must be joined even when recovery recorded lost
+      // background work. Its note cannot turn that attach into a new prompt.
+      const noteContinuation =
+        !reattachingHeldDispatch &&
+        isRestartNoteContinuation(
+          run,
+          projection.runs,
+          projection.providerTurns,
+          projection.attempts,
+        );
       const restartCancelledWork = pendingRestartCancelledBackgroundWork({
         runs: projection.runs,
         providerTurns: projection.providerTurns,
