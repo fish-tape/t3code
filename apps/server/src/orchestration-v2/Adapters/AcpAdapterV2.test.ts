@@ -15318,6 +15318,117 @@ it.live("preparation allows new work after Stop restarts an admitted turn's runt
   }).pipe(Effect.provide(layerTest), Effect.scoped),
 );
 
+it.live.each(["session_preparation", "retained_dispatch"] as const)(
+  "preparation certified %s rejection keeps cleanup transport-only",
+  (kind) =>
+    Effect.gen(function* () {
+      let root = "",
+        count = 0;
+      const fixture = yield* makePreparationAdapter(
+        { T3_ACP_SESSION_PREPARATION: "1" },
+        {
+          wrapRuntime: (runtime) => ({
+            ...runtime,
+            prompt: () =>
+              Effect.suspend(() => {
+                count++;
+                return Effect.fail(
+                  new EffectAcpErrors.AcpTransportError({
+                    detail: "certified rejection",
+                    cause:
+                      kind === "retained_dispatch" && count === 1
+                        ? { code: -32097 }
+                        : {
+                            code: -32097,
+                            data: {
+                              kind,
+                              dispatch: "rejected",
+                              ...(kind === "retained_dispatch" ? { turnId: root } : {}),
+                            },
+                          },
+                  }),
+                );
+              }),
+          }),
+        },
+      );
+      const sessionScope = yield* Scope.make();
+      const runtime = yield* fixture.open.pipe(Effect.provideService(Scope.Scope, sessionScope));
+      const first = yield* preparedMockTurn(fixture, runtime);
+      root = first.runId;
+      const outcomes: string[] = [];
+      const lifecycle = {
+        beforePrompt: () => Effect.void,
+        result: (value: "completed" | "rejected") =>
+          Effect.sync(() => {
+            outcomes.push(value);
+          }),
+      };
+      yield* runtime.startTurn({ ...first, preparationLifecycle: lifecycle });
+      yield* runtime.events.pipe(
+        Stream.takeUntil((event) => event.type === "turn.terminal"),
+        Stream.runDrain,
+      );
+      if (kind === "retained_dispatch") {
+        const retry = makeTurnInput({
+          ...fixture,
+          providerThread: first.providerThread,
+          now: yield* DateTime.now,
+          ordinal: 2,
+        });
+        yield* runtime.startTurn({
+          ...retry,
+          appThread: {
+            ...first.appThread,
+            sessionPreparation: {
+              ...first.appThread.sessionPreparation!,
+              dispatchingRunId: first.runId,
+              holdRequired: true,
+            },
+          },
+          restartContinuationOfRunId: first.runId,
+          preparationLifecycle: lifecycle,
+        });
+        yield* runtime.events.pipe(
+          Stream.takeUntil((event) => event.type === "turn.terminal"),
+          Stream.runDrain,
+        );
+      }
+      assert.deepEqual(outcomes, ["rejected"]);
+      yield* Scope.close(sessionScope, Exit.void);
+      const methods = yield* pollProtocolMethods(fixture.protocolEvents);
+      assert.notInclude(methods, "session/close");
+      assert.notInclude(methods, "session/delete");
+      assert.notInclude(methods, "session/cancel");
+      assert.notInclude(methods, "session/new");
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+);
+
+it.live("preparation failed completed settlement keeps cleanup transport-only", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makePreparationAdapter({ T3_ACP_SESSION_PREPARATION: "1" });
+    const sessionScope = yield* Scope.make();
+    const runtime = yield* fixture.open.pipe(Effect.provideService(Scope.Scope, sessionScope));
+    const turn = yield* preparedMockTurn(fixture, runtime);
+    yield* runtime.startTurn({
+      ...turn,
+      preparationLifecycle: {
+        beforePrompt: () => Effect.void,
+        result: () => Effect.die("central completed settlement unavailable"),
+      },
+    });
+    yield* runtime.events.pipe(
+      Stream.takeUntil((event) => event.type === "turn.terminal"),
+      Stream.runDrain,
+    );
+    yield* Scope.close(sessionScope, Exit.void);
+    const methods = yield* pollProtocolMethods(fixture.protocolEvents);
+    assert.equal(methods.filter((method) => method === "session/prompt").length, 1);
+    assert.notInclude(methods, "session/close");
+    assert.notInclude(methods, "session/cancel");
+  }).pipe(Effect.provide(layerTest), Effect.scoped),
+);
+
 it.live("preparation release closes only the transport and preserves the native session", () =>
   Effect.gen(function* () {
     const fixture = yield* makePreparationAdapter({ T3_ACP_SESSION_PREPARATION: "1" });

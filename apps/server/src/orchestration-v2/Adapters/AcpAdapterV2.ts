@@ -6041,6 +6041,10 @@ export function makeAcpAdapterV2(
 
         let preparedRetainedSession = input.preparationRequestId !== undefined;
         let retainedDispatchAttachment = input.retainedNativeThreadRequired === true;
+        // A rejected/uncertain turn still owns preserved native state even
+        // when its preparation reservation is reusable. Only durable completed
+        // settlement permits ordinary native teardown or replacement again.
+        let retainedSessionHold = preparedRetainedSession || retainedDispatchAttachment;
         let preparedBinding:
           | { requestId: string; sessionId: string; generation: string; consumed: boolean }
           | undefined;
@@ -6050,7 +6054,7 @@ export function makeAcpAdapterV2(
           resumeSessionId?: string,
         ) {
           if (
-            (preparedRetainedSession || retainedDispatchAttachment) &&
+            (preparedRetainedSession || retainedDispatchAttachment || retainedSessionHold) &&
             runtimeScope !== undefined
           ) {
             return yield* new EffectAcpErrors.AcpTransportError({
@@ -6095,7 +6099,7 @@ export function makeAcpAdapterV2(
             replacement: AcpSessionRuntime.AcpSessionRuntimeStartResult,
           ) => Effect.Effect<void>,
         ) {
-          if (preparedRetainedSession || retainedDispatchAttachment)
+          if (preparedRetainedSession || retainedDispatchAttachment || retainedSessionHold)
             return yield* new EffectAcpErrors.AcpTransportError({
               cause: "preparation_invalidated",
               detail: "Prepared attachment cannot be replaced",
@@ -6969,7 +6973,10 @@ export function makeAcpAdapterV2(
                 detail: `ACP provider turn ${existing.providerTurnId} is still active`,
               });
             }
-            if (retainedAttach) retainedDispatchAttachment = true;
+            if (retainedAttach) {
+              retainedDispatchAttachment = true;
+              retainedSessionHold = true;
+            }
             useProviderThreadIdentity(turnInput.providerThread);
             // Session activation can itself invoke client fs/terminal methods.
             // Install the incoming thread policy before load/resume so those
@@ -7321,6 +7328,7 @@ export function makeAcpAdapterV2(
             }
             const settlePreparation = (outcome: "completed" | "rejected") =>
               (turnInput.preparationLifecycle?.result(outcome) ?? Effect.void).pipe(
+                Effect.as(true),
                 // Persistence failure keeps the durable hold. It must never
                 // replace a native result or skip terminal event delivery.
                 Effect.catchCause(() =>
@@ -7329,7 +7337,7 @@ export function makeAcpAdapterV2(
                     threadId: turnInput.threadId,
                     runId: turnInput.runId,
                     outcome,
-                  }),
+                  }).pipe(Effect.as(false)),
                 ),
               );
             yield* runtime.prompt(promptPayload).pipe(
@@ -7339,7 +7347,13 @@ export function makeAcpAdapterV2(
               Effect.tap(() => {
                 retainedDispatchAttachment = false;
                 preparedRetainedSession = false;
-                return settlePreparation("completed");
+                return settlePreparation("completed").pipe(
+                  Effect.tap((settled) =>
+                    Effect.sync(() => {
+                      if (settled) retainedSessionHold = false;
+                    }),
+                  ),
+                );
               }),
               Effect.tap(() =>
                 Ref.update(promptInstructionStates, (current) => {
@@ -7460,7 +7474,7 @@ export function makeAcpAdapterV2(
               }),
             );
             const requests = [...(yield* Ref.get(pendingRuntimeRequests)).values()];
-            if (!preparedRetainedSession && !retainedDispatchAttachment) {
+            if (!preparedRetainedSession && !retainedDispatchAttachment && !retainedSessionHold) {
               yield* Effect.forEach(
                 requests,
                 (request) =>
@@ -7487,6 +7501,7 @@ export function makeAcpAdapterV2(
             if (
               !preparedRetainedSession &&
               !retainedDispatchAttachment &&
+              !retainedSessionHold &&
               sessionCapabilities?.close != null
             ) {
               yield* runtimeTransitionPermit.withPermitsIfAvailable(1)(
@@ -7630,6 +7645,7 @@ export function makeAcpAdapterV2(
                   });
                 }
                 preparedRetainedSession = true;
+                retainedSessionHold = true;
                 preparedBinding = {
                   requestId: preparation.requestId,
                   ...decoded.value[ACP_SESSION_PREPARATION],

@@ -127,7 +127,10 @@ The fence prevents a delayed original request from ever starting. T3 matches the
 exact root turn ID before clearing dispatch intent, then requires fresh preparation
 and a new genuine turn ID. Retrying reconciliation retrieves the same proof if
 central settlement failed; there need not be a retained completion. A journaled
-turn, changed generation, unavailable controller or missing proof remains held.
+turn, changed generation before fencing, unavailable controller or missing proof remains held.
+Once persisted, the fence's original request and generation can prove rejection
+even when the worker later parks, becomes unreachable or changes generation.
+That historical proof grants no current toolkit/binding readiness.
 An older controller without reconciliation support fails held. There is no blind
 replay or database edit procedure. A stopped run is reattached only by this explicit command;
 automatic restart deliveries keep their Stop exclusions.
@@ -149,6 +152,11 @@ After settlement, later turns and ordinary cleanup do not reuse the consumed
 marker. Before dispatch, detach, release, restart or any attachment/binding change
 invalidates readiness and requires fresh preparation. An initial failed preparation
 does not hold an ordinary thread; a failed refresh preserves an established hold.
+Certified rejection leaves that retained hold intact: cleanup releases only the
+local transport and runtime replacement remains refused, while fresh preparation
+may reuse the existing transport. Ordinary native close becomes eligible only
+after native completion and successful durable completed settlement. A failed
+settlement cannot make cleanup destroy retained work.
 Retrying a current request returns its receipt without reapplying the toolkit;
 an expired request cannot be replayed into a new attachment.
 
