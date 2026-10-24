@@ -81,6 +81,11 @@ const runningCommandSeparateSession = process.env.T3_ACP_RUNNING_COMMAND_SEPARAT
 const exitAfterRunningCommandLaunch = process.env.T3_ACP_EXIT_AFTER_RUNNING_COMMAND_LAUNCH === "1";
 const omitXAiPromptCompleteStopReason =
   process.env.T3_ACP_OMIT_XAI_PROMPT_COMPLETE_STOP_REASON === "1";
+const isPreparation = Schema.is(
+  Schema.Struct({ requestId: Schema.String, expectedGeneration: Schema.optional(Schema.String) }),
+);
+const supportsSessionPreparation = process.env.T3_ACP_SESSION_PREPARATION === "1";
+let preparedRequestId: string | undefined;
 const failLoadSession = process.env.T3_ACP_FAIL_LOAD_SESSION === "1";
 const failLoadSessionAfterConfigReplay =
   process.env.T3_ACP_FAIL_LOAD_SESSION_AFTER_CONFIG_REPLAY === "1";
@@ -488,7 +493,10 @@ const program = Effect.gen(function* () {
       return {
         protocolVersion: 2,
         info: { name: "t3-acp-mock-agent", version: "0.0.0" },
-        _meta: { modelState: modelState() },
+        _meta: {
+          modelState: modelState(),
+          ...(supportsSessionPreparation ? { "t3code.sessionPreparation": 1 } : {}),
+        },
         capabilities: {
           session: {
             ...(supportsSessionLifecycle ? { fork: {}, additionalDirectories: {} } : {}),
@@ -640,8 +648,30 @@ const program = Effect.gen(function* () {
   yield* agent.handleLoadSession((request) =>
     Effect.gen(function* () {
       const requestedSessionId = String(request.sessionId ?? sessionId);
+      const preparation = request._meta?.["t3code.sessionPreparation"];
+      if (supportsSessionPreparation && preparation !== undefined) {
+        if (!isPreparation(preparation)) {
+          return yield* AcpError.AcpRequestError.invalidParams("Invalid preparation");
+        }
+        preparedRequestId = preparation.requestId;
+      }
       if (failLoadSession) {
         return yield* AcpError.AcpRequestError.internalError("Mock load session failure");
+      }
+      if (supportsSessionPreparation && preparation !== undefined) {
+        // Strict preparation acknowledges the existing attachment without replaying history.
+        return {
+          configOptions: configOptions(),
+          _meta: {
+            "t3code.sessionPreparation": {
+              sessionId: requestedSessionId,
+              generation: "mock-generation-1",
+              toolkitApplied: true,
+              idle: true,
+              pendingPermissions: 0,
+            },
+          },
+        };
       }
       if (failLoadSessionAfterConfigReplay) {
         yield* agent.client.sessionUpdate({
@@ -871,6 +901,22 @@ const program = Effect.gen(function* () {
   yield* agent.handlePrompt((request) =>
     Effect.gen(function* () {
       const requestedSessionId = String(request.sessionId ?? sessionId);
+      if (supportsSessionPreparation && preparedRequestId !== undefined) {
+        const preparation = request._meta?.["t3code.sessionPreparation"];
+        if (
+          !isPreparation(preparation) ||
+          preparation.requestId !== preparedRequestId ||
+          preparation.expectedGeneration !== "mock-generation-1"
+        ) {
+          return yield* AcpError.AcpRequestError.invalidParams("Stale preparation");
+        }
+        preparedRequestId = undefined;
+      } else if (
+        supportsSessionPreparation &&
+        request._meta?.["t3code.sessionPreparation"] !== undefined
+      ) {
+        return yield* AcpError.AcpRequestError.invalidParams("Preparation already consumed");
+      }
       beginAcpMockPrompt(cancelledSessions, requestedSessionId);
       promptCount += 1;
       if (

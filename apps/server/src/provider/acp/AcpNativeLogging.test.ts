@@ -304,3 +304,38 @@ nodeServicesIt("ACP native logging", (it) => {
     }),
   );
 });
+
+it.effect("preparation diagnostics exclude toolkit configuration and receipt metadata", () =>
+  Effect.gen(function* () {
+    const records: Array<unknown> = [];
+    const makeLogger = yield* makeAcpNativeLoggerFactory();
+    const logger = makeLogger({
+      provider: ProviderDriverKind.make("acp-test"),
+      threadId: ThreadId.make("preparation-logging"),
+      verboseProtocolLogging: true,
+      nativeEventLogger: {
+        filePath: "/unused/fake-native-log",
+        write: (event) => Effect.sync(() => void records.push(event)),
+        close: () => Effect.void,
+      },
+    });
+    const sensitive = "fake-preparation-toolkit-credential";
+    const payload = {
+      sessionId: "retained",
+      mcpServers: [{ headers: { Authorization: sensitive } }],
+      _meta: { "t3code.sessionPreparation": { requestId: "request-1" } },
+    };
+    yield* logger.requestLogger!({
+      method: "session/load",
+      payload,
+      status: "succeeded",
+      result: { _meta: { token: sensitive } },
+    });
+    yield* logger.protocolLogging!.logger!({
+      direction: "outgoing",
+      stage: "raw",
+      payload: encodeUnknownJson({ method: "session/load", params: payload }),
+    });
+    assert.isFalse(encodeUnknownJson(records).includes(sensitive));
+  }).pipe(Effect.provide(NodeServices.layer)),
+);

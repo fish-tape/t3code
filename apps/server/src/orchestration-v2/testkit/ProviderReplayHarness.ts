@@ -342,6 +342,8 @@ export function layerWithRegistry<Error>(
     Layer.provide(
       Layer.mergeAll(
         layerProvidedRegistry,
+        layerRuntime,
+        ThreadCommandExecutor.layer,
         layerEventSinkProvided,
         IdAllocator.layer,
         McpSessionRegistryTestkit.layer,

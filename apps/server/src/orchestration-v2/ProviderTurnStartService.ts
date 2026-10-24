@@ -535,6 +535,11 @@ export const layer: Layer.Layer<
           providerSessionId,
           modelSelection: run.modelSelection,
           runtimePolicy: resolvedRuntimePolicy,
+          ...(projection.thread.sessionPreparation === undefined
+            ? {}
+            : {
+                sessionPreparation: projection.thread.sessionPreparation,
+              }),
           ...(existingSessionProjection === undefined
             ? {}
             : { resumeFromSession: existingSessionProjection }),
@@ -689,6 +694,10 @@ export const layer: Layer.Layer<
         );
         if (resumed._tag === "Success") {
           return resumed.success;
+        }
+
+        if (projection.thread.sessionPreparation !== undefined) {
+          return yield* loadFromProvider(Effect.fail(resumed.failure));
         }
 
         if (

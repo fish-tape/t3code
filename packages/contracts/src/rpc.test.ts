@@ -2,7 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 
-import { ORCHESTRATION_V2_WS_METHODS } from "./orchestrationV2.ts";
+import { NativeSessionPreparationReceipt, ORCHESTRATION_V2_WS_METHODS } from "./orchestrationV2.ts";
 import { WsRpcGroup, WsSubscribeServerConfigRpc } from "./rpc.ts";
 
 /**
@@ -63,6 +63,45 @@ describe("WebSocket RPC contracts", () => {
           threadId: "thread-1",
           scopeId: "scope-1",
           checkpointId: "checkpoint-1",
+        }),
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("retained-session preparation", () => {
+  it("accepts only an idle applied-toolkit acknowledgement", () => {
+    const decode = Schema.decodeUnknownExit(NativeSessionPreparationReceipt);
+    expect(
+      Exit.isFailure(
+        decode({
+          sessionId: "retained",
+          generation: "g1",
+          toolkitApplied: false,
+          idle: true,
+          pendingPermissions: 0,
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      Exit.isFailure(
+        decode({
+          sessionId: "retained",
+          generation: "g1",
+          toolkitApplied: true,
+          idle: true,
+          pendingPermissions: 1,
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      Exit.isFailure(
+        decode({
+          sessionId: "retained",
+          generation: 1,
+          toolkitApplied: true,
+          idle: true,
+          pendingPermissions: 0,
         }),
       ),
     ).toBe(true);

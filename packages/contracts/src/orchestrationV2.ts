@@ -361,8 +361,63 @@ export const OrchestrationV2LimitRecoveryUpdate = Schema.Struct({
 );
 export type OrchestrationV2LimitRecoveryUpdate = typeof OrchestrationV2LimitRecoveryUpdate.Type;
 
+/** An acknowledged existing native session; deliberately excludes toolkit configuration. */
+export const NativeSessionPreparationReceipt = Schema.Struct({
+  sessionId: TrimmedNonEmptyString,
+  generation: TrimmedNonEmptyString,
+  toolkitApplied: Schema.Literal(true),
+  idle: Schema.Literal(true),
+  pendingPermissions: Schema.Literal(0),
+});
+export type NativeSessionPreparationReceipt = typeof NativeSessionPreparationReceipt.Type;
+
+export const PrepareProviderSessionInput = Schema.Struct({
+  requestId: CommandId,
+  threadId: ThreadId,
+  providerThreadId: ProviderThreadId,
+  providerSessionId: ProviderSessionId,
+  nativeId: TrimmedNonEmptyString,
+  completedRunId: RunId,
+});
+export type PrepareProviderSessionInput = typeof PrepareProviderSessionInput.Type;
+
+export const ProviderSessionPreparationReceipt = Schema.Struct({
+  ...PrepareProviderSessionInput.fields,
+  attachmentId: TrimmedNonEmptyString,
+  nativeSession: NativeSessionPreparationReceipt,
+});
+export type ProviderSessionPreparationReceipt = typeof ProviderSessionPreparationReceipt.Type;
+
+const SessionPreparationFailureReason = Schema.Literals([
+  "binding_changed",
+  "owner_busy",
+  "request_expired",
+  "attachment_failed",
+]);
+
+export const ProviderSessionPreparation = Schema.Struct({
+  ...PrepareProviderSessionInput.fields,
+  receipt: Schema.optional(ProviderSessionPreparationReceipt),
+  failure: Schema.optional(SessionPreparationFailureReason),
+});
+export type ProviderSessionPreparation = typeof ProviderSessionPreparation.Type;
+
+export class PrepareProviderSessionError extends Schema.TaggedError<PrepareProviderSessionError>()(
+  "PrepareProviderSessionError",
+  {
+    threadId: ThreadId,
+    reason: SessionPreparationFailureReason,
+  },
+) {
+  override get message(): string {
+    return `Provider session preparation is held: ${this.reason}.`;
+  }
+}
+
 export const OrchestrationV2AppThread = Schema.Struct({
   ...OrchestrationV2CreationFields,
+  /** Survives process loss so a retained-work continuation cannot silently start elsewhere. */
+  sessionPreparation: Schema.optional(ProviderSessionPreparation),
   id: ThreadId,
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
@@ -3141,6 +3196,7 @@ export type OrchestrationV2InternalCommand = typeof OrchestrationV2InternalComma
 export type OrchestrationV2ServerCommand = OrchestrationV2Command | OrchestrationV2InternalCommand;
 
 export const ORCHESTRATION_V2_WS_METHODS = {
+  prepareProviderSession: "orchestration.prepareProviderSession",
   dispatchCommand: "orchestration.dispatchCommand",
   getTurnDiff: "orchestration.getTurnDiff",
   getFullThreadDiff: "orchestration.getFullThreadDiff",

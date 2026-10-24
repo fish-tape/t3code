@@ -1,6 +1,7 @@
 import type { OrchestrationV2HistoricalMessage } from "@t3tools/contracts";
 import {
   ChatAttachment,
+  type NativeSessionPreparationReceipt,
   CheckpointId,
   MessageId,
   ModelSelection,
@@ -374,6 +375,8 @@ export const ProviderAdapterV2Error = Schema.Union([
 export type ProviderAdapterV2Error = typeof ProviderAdapterV2Error.Type;
 
 export interface ProviderAdapterV2OpenSessionInput {
+  /** Strict existing-session attachment: no fresh native fallback is permitted. */
+  readonly preparationRequestId?: string;
   readonly threadId: ThreadId;
   readonly providerSessionId: ProviderSessionId;
   readonly modelSelection: ModelSelection;
@@ -523,6 +526,11 @@ export interface ProviderAdapterV2McpApps {
 }
 
 export interface ProviderAdapterV2SessionRuntime {
+  readonly prepareThread?: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+    readonly requestId: string;
+    readonly expectedGeneration?: string;
+  }) => Effect.Effect<NativeSessionPreparationReceipt, ProviderAdapterV2Error>;
   readonly instanceId: ProviderInstanceId;
   readonly driver: ProviderDriverKind;
   readonly providerSessionId: ProviderSessionId;
@@ -626,6 +634,7 @@ export interface ProviderAdapterV2SessionRuntime {
 }
 
 export interface ProviderAdapterV2Shape {
+  readonly supportsSessionPreparation?: boolean;
   readonly instanceId: ProviderInstanceId;
   readonly driver: ProviderDriverKind;
   readonly getCapabilities: () => Effect.Effect<

@@ -78,6 +78,41 @@ run before the prompt. They reject profiles with such configuration before launc
 instructions and tool denial do not create a native sandbox.
 See [helper constraints](../../apps/server/src/textGeneration/AntigravityTextGeneration.ts).
 
+## Prepare a retained stopped session without a prompt
+
+The authenticated `orchestration.prepareProviderSession` RPC requires
+`environment:maintain`. Supply a fresh `requestId`, the app `threadId`, its expected
+`providerThreadId`, `providerSessionId`, logical `nativeId`, and latest
+`completedRunId`. The manager verifies idle ownership under the normal thread lock,
+uses the current registry/toolkit policy, and strictly loads that existing session.
+It creates no message or run and never falls back to a new native session.
+
+The ACP controller must advertise root `_meta["t3code.sessionPreparation"] = 1`.
+Strict load carries `{ requestId, expectedGeneration? }` in that metadata key;
+ACP v2 represents the compatibility load as `session/resume`. A real response must
+acknowledge the same logical session, an opaque generation string, applied toolkit,
+idle state and zero pending permissions. A replay idle gap is insufficient.
+The public receipt adds the expected binding and a process-local attachment identity;
+it excludes toolkit configuration and credentials.
+
+Preparation reserves the attachment for inspection without keeping it alive through
+synthetic prompts. The reservation ends when a genuine turn is accepted or the
+operator uses normal detach/release. That next turn carries the same request and
+expected generation. Both T3 and the controller reject a stale marker before native
+dispatch. After the first prompt succeeds, later turns on that same attachment do
+not replay its consumed marker; an uncertain prompt requires preparation again.
+Detach, idle release after the genuine turn, restart, recovery or any
+attachment/binding change requires fresh preparation. Retrying a current request
+returns its receipt without reapplying the toolkit; an expired request cannot be
+replayed into a new attachment.
+
+A parked, absent, destroyed or uncertain worker stays held. Export, migrate and
+restore retained files/native history through a separately authorized lifecycle;
+verify the intended binding and installed tools, then prepare with a new request.
+Preparation does not restore a workspace, recover a worker, upgrade tools, answer
+permissions or authorize a continuation. Controller implementations must preserve
+this strict boundary when adding park/restore behavior.
+
 ## Provider updates run only through the owning installer
 
 A package manager runs only when the resolved executable's path proves it owns the install. Homebrew

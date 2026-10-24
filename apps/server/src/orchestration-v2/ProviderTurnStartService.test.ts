@@ -1,6 +1,7 @@
 import { expect, it, vi } from "vite-plus/test";
 import { it as effectIt } from "@effect/vitest";
 import {
+  CommandId,
   CheckpointScopeId,
   MessageId,
   NodeId,
@@ -167,6 +168,7 @@ function makeLocalCommandHarness(input: {
    */
   readonly historyReadFailureAfterFallback?: unknown;
   readonly durableRestart?: boolean;
+  readonly prepared?: boolean;
   readonly interruptOpen?: boolean;
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
@@ -401,6 +403,22 @@ function makeLocalCommandHarness(input: {
       ),
     ),
   );
+  if (input.prepared) {
+    projection = {
+      ...projection,
+      thread: {
+        ...projection.thread,
+        sessionPreparation: {
+          requestId: CommandId.make("prepared-request"),
+          threadId,
+          providerThreadId,
+          providerSessionId,
+          nativeId: "native-resume-thread",
+          completedRunId: RunId.make("completed-run"),
+        },
+      },
+    };
+  }
   const resumeFallbackEnsureThread = vi.fn(() => Effect.succeed(providerThread));
   const resumeFallbackSession = {
     driver: providerThread.driver,
@@ -892,4 +910,17 @@ effectIt.effect(
       expect(harness.startRootRun).not.toHaveBeenCalled();
       expect(harness.projection().runs.at(-1)?.status).toBe("failed");
     }),
+);
+
+effectIt.effect("preparation forbids the later null-native fresh-thread fallback", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      prepared: true,
+      historyReadFailureAfterFallback: new Error("must never read fallback history"),
+    });
+    yield* harness.start;
+    expect(harness.resumeFallbackEnsureThread).not.toHaveBeenCalled();
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+  }),
 );

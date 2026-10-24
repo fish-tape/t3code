@@ -11,6 +11,7 @@ import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
+  CommandId,
   CheckpointId,
   GrokSettings,
   EnvironmentId,
@@ -14599,5 +14600,277 @@ it.live("does not create a fresh ACP session when durable load is unavailable", 
       .pipe(Effect.result);
     assert.equal(result._tag, "Failure");
     assert.equal(attempts, 1);
+  }).pipe(Effect.provide(layerTest), Effect.scoped),
+);
+
+const makePreparationAdapter = (environment: Record<string, string>) =>
+  Effect.gen(function* () {
+    const protocolEvents = yield* Queue.unbounded<EffectAcpProtocol.AcpProtocolLogEvent>();
+    const path = yield* Path.Path;
+    const instanceId = ProviderInstanceId.make("acp-retained-preparation");
+    const adapter = makeAcpAdapterV2({
+      crypto: yield* Crypto.Crypto,
+      instanceId,
+      fileSystem: yield* FileSystem.FileSystem,
+      idAllocator: yield* IdAllocator.IdAllocatorV2,
+      serverConfig: yield* ServerConfig.ServerConfig,
+      selfInvocation: yield* resolveSelfInvocation(),
+      flavor: {
+        driver: ACP_TEST_DRIVER,
+        capabilities: AcpProviderCapabilitiesV2,
+        makeRuntime: makeMockRuntime({
+          childProcessSpawner: yield* ChildProcessSpawner.ChildProcessSpawner,
+          mockAgentPath: yield* path.fromFileUrl(
+            new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+          ),
+          protocolEvents,
+          environment: () => environment,
+        }),
+      },
+    });
+    const threadId = ThreadId.make("thread:retained-preparation");
+    const runtimePolicy = ProviderAdapterV2RuntimePolicy.make({
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      cwd: process.cwd(),
+    });
+    const modelSelection = { instanceId, model: "default" };
+    const open = adapter.openSession({
+      threadId,
+      providerSessionId: ProviderSessionId.make("session:retained-preparation"),
+      modelSelection,
+      runtimePolicy,
+      initialNativeThreadId: "retained-worker",
+      preparationRequestId: "prepare-request-1",
+    });
+    return { open, threadId, instanceId, modelSelection, runtimePolicy, protocolEvents };
+  });
+
+it.live("preparation rejects an unsupported ACP before any native load or new call", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makePreparationAdapter({});
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(fixture.open)));
+    const methods = yield* pollProtocolMethods(fixture.protocolEvents);
+    assert.include(methods, "initialize");
+    assert.notInclude(methods, "session/load");
+    assert.notInclude(methods, "session/resume");
+    assert.notInclude(methods, "session/new");
+  }).pipe(Effect.provide(layerTest), Effect.scoped),
+);
+
+it.live("preparation never falls back to a fresh ACP session after initial load failure", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makePreparationAdapter({
+      T3_ACP_SESSION_PREPARATION: "1",
+      T3_ACP_FAIL_LOAD_SESSION: "1",
+    });
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(fixture.open)));
+    const methods = yield* pollProtocolMethods(fixture.protocolEvents);
+    assert.include(methods, "session/resume");
+    assert.notInclude(methods, "session/new");
+    assert.equal(methods.filter((method) => method === "initialize").length, 1);
+  }).pipe(Effect.provide(layerTest), Effect.scoped),
+);
+
+it.live(
+  "preparation forwards its acknowledged request and generation on the next real prompt",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* makePreparationAdapter({
+        T3_ACP_SESSION_PREPARATION: "1",
+        T3_ACP_PROMPT_RESPONSE_TEXT: "retained worker answered",
+      });
+      const runtime = yield* fixture.open;
+      const providerThread = yield* runtime.ensureThread(fixture);
+      const nativeSession = yield* runtime.prepareThread!({
+        providerThread,
+        requestId: "prepare-request-1",
+      });
+      assert.equal(nativeSession.sessionId, "retained-worker");
+      const startup = yield* pollProtocolMethods(fixture.protocolEvents);
+      assert.equal(startup.filter((method) => method === "session/resume").length, 1);
+      assert.notInclude(startup, "session/new");
+      const turn = makeTurnInput({ ...fixture, providerThread, now: yield* DateTime.now });
+      const binding = {
+        requestId: CommandId.make("prepare-request-1"),
+        threadId: fixture.threadId,
+        providerThreadId: providerThread.id,
+        providerSessionId: runtime.providerSessionId,
+        nativeId: "retained-worker",
+        completedRunId: RunId.make("completed-original-run"),
+      };
+      yield* runtime.startTurn({
+        ...turn,
+        appThread: {
+          ...turn.appThread,
+          sessionPreparation: {
+            ...binding,
+            receipt: { ...binding, attachmentId: "test-attachment", nativeSession },
+          },
+        },
+      });
+      const events = yield* runtime.events.pipe(
+        Stream.takeUntil((event) => event.type === "turn.terminal"),
+        Stream.runCollect,
+      );
+      assert.isTrue(
+        events.some((event) => event.type === "turn.terminal" && event.status === "completed"),
+      );
+      const methods = yield* pollProtocolMethods(fixture.protocolEvents);
+      assert.equal(methods.filter((method) => method === "session/prompt").length, 1);
+      assert.notInclude(methods, "session/new");
+      assert.notInclude(methods, "session/resume");
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+);
+
+it.live("preparation is consumed once so later turns do not replay its marker", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makePreparationAdapter({
+      T3_ACP_SESSION_PREPARATION: "1",
+      T3_ACP_PROMPT_RESPONSE_TEXT: "retained worker answered",
+    });
+    const runtime = yield* fixture.open;
+    const providerThread = yield* runtime.ensureThread(fixture);
+    const nativeSession = yield* runtime.prepareThread!({
+      providerThread,
+      requestId: "prepare-request-1",
+    });
+    const binding = {
+      requestId: CommandId.make("prepare-request-1"),
+      threadId: fixture.threadId,
+      providerThreadId: providerThread.id,
+      providerSessionId: runtime.providerSessionId,
+      nativeId: "retained-worker",
+      completedRunId: RunId.make("completed-original-run"),
+    };
+    const first = makeTurnInput({ ...fixture, providerThread, now: yield* DateTime.now });
+    const appThread = {
+      ...first.appThread,
+      sessionPreparation: {
+        ...binding,
+        receipt: { ...binding, attachmentId: "test-attachment", nativeSession },
+      },
+    };
+    yield* runtime.startTurn({ ...first, appThread });
+    yield* runtime.events.pipe(
+      Stream.takeUntil((event) => event.type === "turn.terminal"),
+      Stream.runDrain,
+    );
+    const next = makeTurnInput({
+      ...fixture,
+      providerThread,
+      now: yield* DateTime.now,
+      ordinal: 2,
+    });
+    yield* runtime.startTurn({ ...next, appThread });
+    const events = yield* runtime.events.pipe(
+      Stream.takeUntil((event) => event.type === "turn.terminal"),
+      Stream.runCollect,
+    );
+    assert.isTrue(
+      events.some((event) => event.type === "turn.terminal" && event.status === "completed"),
+    );
+  }).pipe(Effect.provide(layerTest), Effect.scoped),
+);
+
+it.live("preparation holds another prompt after an uncertain native failure", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makePreparationAdapter({
+      T3_ACP_SESSION_PREPARATION: "1",
+      T3_ACP_FAIL_PROMPT: "1",
+    });
+    const runtime = yield* fixture.open;
+    const providerThread = yield* runtime.ensureThread(fixture);
+    const nativeSession = yield* runtime.prepareThread!({
+      providerThread,
+      requestId: "prepare-request-1",
+    });
+    const binding = {
+      requestId: CommandId.make("prepare-request-1"),
+      threadId: fixture.threadId,
+      providerThreadId: providerThread.id,
+      providerSessionId: runtime.providerSessionId,
+      nativeId: "retained-worker",
+      completedRunId: RunId.make("completed-original-run"),
+    };
+    const first = makeTurnInput({ ...fixture, providerThread, now: yield* DateTime.now });
+    const appThread = {
+      ...first.appThread,
+      sessionPreparation: {
+        ...binding,
+        receipt: { ...binding, attachmentId: "test-attachment", nativeSession },
+      },
+    };
+    yield* runtime.startTurn({ ...first, appThread });
+    yield* runtime.events.pipe(
+      Stream.takeUntil((event) => event.type === "turn.terminal"),
+      Stream.runDrain,
+    );
+    const next = makeTurnInput({
+      ...fixture,
+      providerThread,
+      now: yield* DateTime.now,
+      ordinal: 2,
+    });
+    assert.isTrue(
+      Exit.isFailure(yield* runtime.startTurn({ ...next, appThread }).pipe(Effect.exit)),
+    );
+    const methods = yield* pollProtocolMethods(fixture.protocolEvents);
+    assert.equal(methods.filter((method) => method === "session/prompt").length, 1);
+  }).pipe(Effect.provide(layerTest), Effect.scoped),
+);
+
+it.live("preparation release closes only the transport and preserves the native session", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makePreparationAdapter({ T3_ACP_SESSION_PREPARATION: "1" });
+    const sessionScope = yield* Scope.make();
+    yield* fixture.open.pipe(Effect.provideService(Scope.Scope, sessionScope));
+    yield* Scope.close(sessionScope, Exit.void);
+    const methods = yield* pollProtocolMethods(fixture.protocolEvents);
+    assert.include(methods, "session/resume");
+    assert.notInclude(methods, "session/close");
+    assert.notInclude(methods, "session/delete");
+  }).pipe(Effect.provide(layerTest), Effect.scoped),
+);
+
+it.live("preparation rejects a mismatched generation before sending a prompt", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makePreparationAdapter({ T3_ACP_SESSION_PREPARATION: "1" });
+    const runtime = yield* fixture.open;
+    const providerThread = yield* runtime.ensureThread(fixture);
+    const nativeSession = yield* runtime.prepareThread!({
+      providerThread,
+      requestId: "prepare-request-1",
+    });
+    yield* pollProtocolMethods(fixture.protocolEvents);
+    const turn = makeTurnInput({ ...fixture, providerThread, now: yield* DateTime.now });
+    const binding = {
+      requestId: CommandId.make("prepare-request-1"),
+      threadId: fixture.threadId,
+      providerThreadId: providerThread.id,
+      providerSessionId: runtime.providerSessionId,
+      nativeId: "retained-worker",
+      completedRunId: RunId.make("completed-original-run"),
+    };
+    const exit = yield* runtime
+      .startTurn({
+        ...turn,
+        appThread: {
+          ...turn.appThread,
+          sessionPreparation: {
+            ...binding,
+            receipt: {
+              ...binding,
+              attachmentId: "test-attachment",
+              nativeSession: { ...nativeSession, generation: "stale-generation" },
+            },
+          },
+        },
+      })
+      .pipe(Effect.exit);
+    assert.isTrue(Exit.isFailure(exit));
+    const methods = yield* pollProtocolMethods(fixture.protocolEvents);
+    assert.notInclude(methods, "session/prompt");
+    assert.notInclude(methods, "session/new");
   }).pipe(Effect.provide(layerTest), Effect.scoped),
 );

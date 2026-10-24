@@ -2,6 +2,9 @@ import * as NetAddress from "effect/net/NetAddress";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
+  CommandId,
+  RunId,
+  type PrepareProviderSessionInput,
   EnvironmentId,
   type ModelSelection,
   type OrchestrationV2AppThread,
@@ -55,6 +58,7 @@ import {
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+import * as RuntimePolicy from "./RuntimePolicy.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 
 const layerTestDatabase = SqlitePersistence.layerMemory;
@@ -163,6 +167,7 @@ const ExclusiveCapabilities: OrchestrationV2ProviderCapabilities = {
 
 interface TestProviderRuntimeState {
   readonly openCount: number;
+  readonly startCount: number;
   readonly closeCount: number;
   readonly interruptCount: number;
   readonly resumeCount: number;
@@ -172,6 +177,7 @@ interface TestProviderRuntimeState {
 
 const emptyState: TestProviderRuntimeState = {
   openCount: 0,
+  startCount: 0,
   closeCount: 0,
   interruptCount: 0,
   resumeCount: 0,
@@ -309,6 +315,10 @@ function unimplemented(detail: string) {
 function makeProviderAdapter(
   state: Ref.Ref<TestProviderRuntimeState>,
   options: {
+    readonly preparation?: {
+      readonly calls: Ref.Ref<number>;
+      readonly fail?: boolean;
+    };
     readonly failEventStream?: boolean;
     readonly capabilities?: OrchestrationV2ProviderCapabilities;
     readonly mcpConfigs?: Ref.Ref<
@@ -347,6 +357,7 @@ function makeProviderAdapter(
   return {
     instanceId: ProviderInstanceId.make("codex"),
     driver: CODEX_DRIVER,
+    supportsSessionPreparation: options.preparation !== undefined,
     getCapabilities: () => Effect.succeed(options.capabilities ?? CodexCapabilities),
     planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
     openSession: (input) =>
@@ -413,13 +424,37 @@ function makeProviderAdapter(
             : {
                 hasPendingBackgroundWorkForThread: () => options.hasPendingBackgroundWorkForThread!,
               }),
+          ...(options.preparation === undefined
+            ? {}
+            : {
+                prepareThread: ({
+                  providerThread,
+                }: Parameters<NonNullable<ProviderAdapterV2SessionRuntime["prepareThread"]>>[0]) =>
+                  Ref.update(options.preparation!.calls, (n) => n + 1).pipe(
+                    Effect.andThen(
+                      options.preparation!.fail
+                        ? unimplemented("private fake preparation failure")
+                        : Effect.succeed({
+                            sessionId: providerThread.nativeThreadRef!.nativeId!,
+                            generation: "generation-1",
+                            toolkitApplied: true as const,
+                            idle: true as const,
+                            pendingPermissions: 0 as const,
+                          }),
+                    ),
+                  ),
+              }),
           ensureThread: () => unimplemented("ensureThread unused in test"),
           resumeThread: (threadInput) =>
             Ref.update(state, (current) => ({
               ...current,
               resumeCount: current.resumeCount + 1,
             })).pipe(Effect.as(threadInput.providerThread)),
-          startTurn: () => options.startTurn ?? Effect.void,
+          startTurn: () =>
+            Ref.update(state, (current) => ({
+              ...current,
+              startCount: current.startCount + 1,
+            })).pipe(Effect.andThen(options.startTurn ?? Effect.void)),
           steerTurn: () => Effect.void,
           interruptTurn: () =>
             Ref.update(state, (current) => ({
@@ -450,6 +485,7 @@ function makeProviderAdapter(
 function layerTest(input: {
   readonly state: Ref.Ref<TestProviderRuntimeState>;
   readonly idleTimeoutMs: number;
+  readonly preparation?: NonNullable<Parameters<typeof makeProviderAdapter>[1]>["preparation"];
   readonly maxIdlePinMs?: number;
   readonly failEventStream?: boolean;
   readonly capabilities?: OrchestrationV2ProviderCapabilities;
@@ -488,6 +524,7 @@ function layerTest(input: {
           : layerTestEventSink;
   const layerRegistry = ProviderAdapterRegistry.layerSingle(
     makeProviderAdapter(input.state, {
+      ...(input.preparation === undefined ? {} : { preparation: input.preparation }),
       failEventStream: input.failEventStream ?? false,
       ...(input.capabilities === undefined ? {} : { capabilities: input.capabilities }),
       ...(input.mcpConfigs === undefined ? {} : { mcpConfigs: input.mcpConfigs }),
@@ -540,6 +577,8 @@ function layerTest(input: {
           layerProviderEventIngestorTest,
           layerConfiguredMcpRegistry,
           layerTestStores,
+          RuntimePolicy.layer,
+          ThreadCommandExecutor.layer,
           ...(input.serverSettingsLayer === undefined ? [] : [input.serverSettingsLayer]),
           ...(input.projectServiceLayer === undefined ? [] : [input.projectServiceLayer]),
         ),
@@ -4594,4 +4633,502 @@ it.effect(
       });
       assert.isFalse(denied?.capabilities?.has("device"));
     }),
+);
+
+const seedPreparation = Effect.gen(function* () {
+  const ids = yield* IdAllocator.IdAllocatorV2;
+  const sink = yield* EventSink.EventSinkV2;
+  const now = yield* DateTime.now;
+  const threadId = ThreadId.make("retained-preparation-thread");
+  const providerSessionId = yield* ids.allocate.providerSession({
+    threadId,
+    providerInstanceId: modelSelection.instanceId,
+  });
+  const created = yield* makeThreadCreatedEvent({ idAllocator: ids, threadId, now });
+  const providerThread = makeProviderThread({ idAllocator: ids, threadId, providerSessionId, now });
+  const completedRunId = RunId.make("retained-completed-run");
+  const run = {
+    id: completedRunId,
+    threadId,
+    ordinal: 1,
+    providerInstanceId: modelSelection.instanceId,
+    modelSelection,
+    providerThreadId: providerThread.id,
+    userMessageId: yield* ids.allocate.message({ threadId, ordinal: 1 }),
+    rootNodeId: ids.derive.rootNode({ runId: completedRunId }),
+    activeAttemptId: ids.derive.runAttempt({ runId: completedRunId, attemptOrdinal: 1 }),
+    status: "completed" as const,
+    requestedAt: now,
+    startedAt: now,
+    completedAt: now,
+    checkpointId: null,
+    contextHandoffId: null,
+  };
+  yield* sink.write({
+    events: [
+      created,
+      {
+        id: yield* ids.allocate.event({ threadId }),
+        threadId,
+        occurredAt: now,
+        type: "provider-thread.updated",
+        payload: providerThread,
+      },
+      {
+        id: yield* ids.allocate.event({ threadId }),
+        threadId,
+        occurredAt: now,
+        type: "provider-session.attached",
+        payload: { ...makeProviderSession({ providerSessionId, now }), status: "stopped" },
+      },
+      {
+        id: yield* ids.allocate.event({ threadId }),
+        threadId,
+        occurredAt: now,
+        type: "run.created",
+        payload: run,
+      },
+    ],
+  });
+  const input: PrepareProviderSessionInput = {
+    requestId: CommandId.make("prepare-retained-1"),
+    threadId,
+    providerThreadId: providerThread.id,
+    providerSessionId,
+    nativeId: "native-thread",
+    completedRunId,
+  };
+  return { input, providerThread, run, thread: created.payload, now };
+});
+
+function preparationCase<A, E, R>(
+  test: (
+    seed: Effect.Success<typeof seedPreparation>,
+    state: Ref.Ref<TestProviderRuntimeState>,
+    calls: Ref.Ref<number>,
+  ) => Effect.Effect<A, E, R>,
+  options: { unsupported?: boolean; fail?: boolean } = {},
+) {
+  return Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const calls = yield* Ref.make(0);
+    return yield* Effect.gen(function* () {
+      return yield* test(yield* seedPreparation, state, calls);
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 60_000,
+          ...(options.unsupported
+            ? {}
+            : {
+                preparation: {
+                  calls,
+                  ...(options.fail === undefined ? {} : { fail: options.fail }),
+                },
+              }),
+        }),
+      ),
+    );
+  });
+}
+
+it.effect("preparation applies a live toolkit to the retained binding without creating a run", () =>
+  preparationCase(({ input }, state, calls) =>
+    Effect.gen(function* () {
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const registry = yield* McpSessionRegistry.McpSessionRegistry;
+      const receipt = yield* manager.prepare(input);
+      assert.deepEqual(receipt.nativeSession, {
+        sessionId: input.nativeId,
+        generation: "generation-1",
+        toolkitApplied: true,
+        idle: true,
+        pendingPermissions: 0,
+      });
+      const config = McpProviderSession.readMcpProviderSession(input.threadId)!;
+      const credential = yield* registry.resolve(
+        config.authorizationHeader.replace(/^Bearer\s+/, ""),
+      );
+      assert.equal(credential?.thread.threadId, input.threadId);
+      assert.equal((yield* store.getRuntimeRecoveryProjection(input.threadId)).runs.length, 1);
+      assert.equal((yield* Ref.get(state)).openCount, 1);
+      assert.equal(yield* Ref.get(calls), 1);
+      assert.isFalse(JSON.stringify(receipt).includes(config.authorizationHeader));
+      assert.deepEqual(
+        Object.keys(receipt).sort(),
+        [...Object.keys(input), "attachmentId", "nativeSession"].sort(),
+      );
+    }),
+  ),
+);
+
+it.effect("preparation retries return the same receipt without applying credentials again", () =>
+  preparationCase(({ input }, state, calls) =>
+    Effect.gen(function* () {
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const first = yield* manager.prepare(input);
+      assert.deepEqual(yield* manager.prepare(input), first);
+      assert.equal(yield* Ref.get(calls), 1);
+      assert.equal((yield* Ref.get(state)).openCount, 1);
+    }),
+  ),
+);
+
+it.effect("preparation rejects stale expected bindings before opening the adapter", () =>
+  preparationCase(({ input }, state) =>
+    Effect.gen(function* () {
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const error = yield* manager
+        .prepare({ ...input, nativeId: "other-worker" })
+        .pipe(Effect.flip);
+      assert.equal(error.reason, "binding_changed");
+      assert.equal((yield* Ref.get(state)).openCount, 0);
+    }),
+  ),
+);
+
+it.effect("preparation rejects unsupported adapters before opening a native session", () =>
+  preparationCase(
+    ({ input }, state) =>
+      Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const error = yield* manager.prepare(input).pipe(Effect.flip);
+        assert.equal(error.reason, "attachment_failed");
+        assert.equal((yield* Ref.get(state)).openCount, 0);
+      }),
+    { unsupported: true },
+  ),
+);
+
+it.effect.each(["running", "permission", "uncertain"] as const)(
+  "preparation holds %s ownership without answering or opening",
+  (busy) =>
+    preparationCase(({ input, run, providerThread, now }, state) =>
+      Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const ids = yield* IdAllocator.IdAllocatorV2;
+        if (busy === "permission") {
+          yield* sink.write({
+            events: (yield* makePendingRuntimeRequestEvents({
+              idAllocator: ids,
+              threadId: input.threadId,
+              providerSessionId: input.providerSessionId,
+              providerThread,
+              now,
+            })).events,
+          });
+        } else {
+          yield* sink.write({
+            events: [
+              {
+                id: yield* ids.allocate.event({ threadId: input.threadId }),
+                threadId: input.threadId,
+                occurredAt: now,
+                type: "run.updated",
+                payload: { ...run, status: busy === "running" ? "running" : "interrupted" },
+              },
+            ],
+          });
+        }
+        const error = yield* manager.prepare(input).pipe(Effect.flip);
+        assert.include(["owner_busy", "binding_changed"], error.reason);
+        assert.equal((yield* Ref.get(state)).openCount, 0);
+      }),
+    ),
+);
+
+it.effect("preparation release invalidates readiness and requires a new request", () =>
+  preparationCase(({ input }, state, calls) =>
+    Effect.gen(function* () {
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      yield* manager.prepare(input);
+      yield* manager.release({
+        providerSessionId: input.providerSessionId,
+        reason: "manual_shutdown",
+      });
+      const error = yield* manager.prepare(input).pipe(Effect.flip);
+      assert.equal(error.reason, "request_expired");
+      assert.equal(yield* Ref.get(calls), 1);
+      assert.equal((yield* Ref.get(state)).openCount, 1);
+    }),
+  ),
+);
+
+it.effect("preparation failure releases only its owned new attachment and hides its cause", () =>
+  preparationCase(
+    ({ input }, state) =>
+      Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const error = yield* manager.prepare(input).pipe(Effect.flip);
+        assert.equal(error.message, "Provider session preparation is held: attachment_failed.");
+        assert.notInclude(JSON.stringify(error), "private fake");
+        assert.isTrue(Option.isNone(yield* manager.get(input.providerSessionId)));
+        assert.equal((yield* Ref.get(state)).closeCount, 1);
+        assert.isUndefined(McpProviderSession.readMcpProviderSession(input.threadId));
+      }),
+    { fail: true },
+  ),
+);
+
+it.effect("preparation holds its inspection reservation against idle release", () =>
+  preparationCase(({ input }, state) =>
+    Effect.gen(function* () {
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const receipt = yield* manager.prepare(input);
+      yield* TestClock.adjust("2 minutes");
+      assert.isTrue(Option.isSome(yield* manager.get(input.providerSessionId)));
+      assert.equal((yield* Ref.get(state)).closeCount, 0);
+      assert.deepEqual(yield* manager.prepare(input), receipt);
+    }),
+  ),
+);
+
+it.effect("preparation never trusts a persisted receipt after a process restart", () =>
+  preparationCase(({ input, thread, now }, state) =>
+    Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const ids = yield* IdAllocator.IdAllocatorV2;
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const receipt = {
+        ...input,
+        attachmentId: "previous-process-attachment",
+        nativeSession: {
+          sessionId: input.nativeId,
+          generation: "old-generation",
+          toolkitApplied: true as const,
+          idle: true as const,
+          pendingPermissions: 0 as const,
+        },
+      };
+      yield* sink.write({
+        events: [
+          {
+            id: yield* ids.allocate.event({ threadId: input.threadId }),
+            threadId: input.threadId,
+            occurredAt: now,
+            type: "thread.metadata-updated",
+            payload: { ...thread, sessionPreparation: { ...input, receipt } },
+          },
+        ],
+      });
+      const error = yield* manager.prepare(input).pipe(Effect.flip);
+      assert.equal(error.reason, "request_expired");
+      assert.equal((yield* Ref.get(state)).openCount, 0);
+    }),
+  ),
+);
+
+const preparationTurn = (
+  seed: Effect.Success<typeof seedPreparation>,
+  thread: OrchestrationV2AppThread,
+) =>
+  Effect.gen(function* () {
+    const ids = yield* IdAllocator.IdAllocatorV2;
+    const runId = RunId.make("next-genuine-run");
+    return {
+      appThread: thread,
+      threadId: seed.input.threadId,
+      runId,
+      runOrdinal: 2,
+      providerTurnOrdinal: 2,
+      attemptId: ids.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+      rootNodeId: ids.derive.rootNode({ runId }),
+      providerThread: seed.providerThread,
+      modelSelection,
+      runtimePolicy,
+      message: {
+        createdBy: "user" as const,
+        creationSource: "web" as const,
+        messageId: yield* ids.allocate.message({ threadId: seed.input.threadId, ordinal: 2 }),
+        text: "Continue the retained work",
+        attachments: [],
+      },
+    };
+  });
+
+it.effect("preparation detach prevents a stale turn from reaching the adapter", () =>
+  preparationCase((seed, state) =>
+    Effect.gen(function* () {
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      yield* manager.prepare(seed.input);
+      const thread = (yield* store.getThreadRecords(seed.input.threadId, [])).thread;
+      const runtime = Option.getOrThrow(yield* manager.get(seed.input.providerSessionId));
+      yield* manager.detach({
+        providerSessionId: seed.input.providerSessionId,
+        threadId: seed.input.threadId,
+      });
+      assert.isTrue(
+        Exit.isFailure(
+          yield* runtime.startTurn(yield* preparationTurn(seed, thread)).pipe(Effect.exit),
+        ),
+      );
+      assert.equal((yield* Ref.get(state)).startCount, 0);
+    }),
+  ),
+);
+
+it.effect("preparation consumes its reservation when the genuine turn is accepted", () =>
+  preparationCase((seed, state) =>
+    Effect.gen(function* () {
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      yield* manager.prepare(seed.input);
+      const thread = (yield* store.getThreadRecords(seed.input.threadId, [])).thread;
+      const runtime = Option.getOrThrow(yield* manager.get(seed.input.providerSessionId));
+      yield* runtime.startTurn(yield* preparationTurn(seed, thread));
+      assert.equal((yield* Ref.get(state)).startCount, 1);
+      const ids = yield* IdAllocator.IdAllocatorV2;
+      const subscription = yield* runtime.subscribeEvents!;
+      const terminal = yield* subscription.events.pipe(
+        Stream.takeUntil((event) => event.type === "turn.terminal"),
+        Stream.runDrain,
+        Effect.forkChild,
+      );
+      const queue = (yield* Ref.get(state)).eventQueues.get(String(seed.input.providerSessionId))!;
+      yield* Queue.offer(queue, {
+        type: "turn.terminal",
+        driver: CODEX_DRIVER,
+        providerThreadId: seed.providerThread.id,
+        providerTurnId: ids.derive.providerTurn({
+          driver: CODEX_DRIVER,
+          nativeTurnId: "next-turn",
+        }),
+        runOrdinal: 2,
+        status: "completed",
+        failure: null,
+        threadDisposition: "reusable",
+      });
+      yield* Fiber.join(terminal);
+      yield* TestClock.adjust("2 minutes");
+      assert.isTrue(Option.isNone(yield* manager.get(seed.input.providerSessionId)));
+    }),
+  ),
+);
+
+it.effect("preparation failure preserves an unrelated live attachment", () =>
+  preparationCase(
+    ({ input, now }, state) =>
+      Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const ids = yield* IdAllocator.IdAllocatorV2;
+        const otherThreadId = ThreadId.make("unrelated-owner");
+        const otherSessionId = yield* ids.allocate.providerSession({
+          threadId: otherThreadId,
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* sink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator: ids, threadId: otherThreadId, now }),
+          ],
+        });
+        yield* manager.open({
+          threadId: otherThreadId,
+          providerSessionId: otherSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const configBefore = McpProviderSession.readMcpProviderSession(otherThreadId);
+        yield* manager.prepare(input).pipe(Effect.flip);
+        assert.isTrue(Option.isSome(yield* manager.get(otherSessionId)));
+        assert.isTrue(McpProviderSession.readMcpProviderSession(otherThreadId) === configBefore);
+        assert.equal((yield* Ref.get(state)).closeCount, 1);
+      }),
+    { fail: true },
+  ),
+);
+
+it.effect("preparation requires the current request marker even when generations match", () =>
+  preparationCase((seed, state) =>
+    Effect.gen(function* () {
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const first = yield* manager.prepare(seed.input);
+      const oldThread = (yield* store.getThreadRecords(seed.input.threadId, [])).thread;
+      yield* manager.detach({
+        providerSessionId: seed.input.providerSessionId,
+        threadId: seed.input.threadId,
+      });
+      const second = yield* manager.prepare({
+        ...seed.input,
+        requestId: CommandId.make("prepare-retained-2"),
+      });
+      assert.equal(first.nativeSession.generation, second.nativeSession.generation);
+      const runtime = Option.getOrThrow(yield* manager.get(seed.input.providerSessionId));
+      assert.isTrue(
+        Exit.isFailure(
+          yield* runtime.startTurn(yield* preparationTurn(seed, oldThread)).pipe(Effect.exit),
+        ),
+      );
+      assert.equal((yield* Ref.get(state)).startCount, 0);
+    }),
+  ),
+);
+
+it.effect("preparation rejects a different request while a ready marker owns the attachment", () =>
+  preparationCase(({ input }, state, calls) =>
+    Effect.gen(function* () {
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const first = yield* manager.prepare(input);
+      const error = yield* Effect.flip(
+        manager.prepare({ ...input, requestId: CommandId.make("competing-preparation") }),
+      );
+      assert.equal(error.reason, "owner_busy");
+      assert.deepEqual(yield* manager.prepare(input), first);
+      assert.equal(yield* Ref.get(calls), 1);
+      assert.equal((yield* Ref.get(state)).openCount, 1);
+    }),
+  ),
+);
+
+it.effect(
+  "preparation reservation rejects another thread's attachment without minting its toolkit",
+  () =>
+    preparationCase(({ input, now }) =>
+      Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const ids = yield* IdAllocator.IdAllocatorV2;
+        const receipt = yield* manager.prepare(input);
+        const otherThreadId = ThreadId.make("competing-attachment");
+        yield* sink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator: ids, threadId: otherThreadId, now }),
+          ],
+        });
+        assert.isTrue(
+          Exit.isFailure(
+            yield* manager
+              .open({
+                threadId: otherThreadId,
+                providerSessionId: input.providerSessionId,
+                modelSelection,
+                runtimePolicy,
+              })
+              .pipe(Effect.exit),
+          ),
+        );
+        assert.isUndefined(McpProviderSession.readMcpProviderSession(otherThreadId));
+        assert.deepEqual(yield* manager.prepare(input), receipt);
+      }),
+    ),
+);
+
+it.effect("preparation retries preserve a failed outcome without another load", () =>
+  preparationCase(
+    ({ input }, state, calls) =>
+      Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const first = yield* manager.prepare(input).pipe(Effect.flip);
+        const retry = yield* manager.prepare(input).pipe(Effect.flip);
+        assert.equal(retry.reason, first.reason);
+        assert.equal(yield* Ref.get(calls), 1);
+        assert.equal((yield* Ref.get(state)).openCount, 1);
+      }),
+    { fail: true },
+  ),
 );
