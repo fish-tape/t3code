@@ -41,6 +41,45 @@ import * as RuntimePolicy from "./RuntimePolicy.ts";
 
 const isDomainEvent = Schema.is(OrchestrationV2DomainEvent);
 
+it("retains the original run when a recovery crashes before its cursor commits", () => {
+  const providerThreadId = ProviderThreadId.make("retained-chain-thread");
+  const original = { id: RunId.make("original"), ordinal: 1, providerThreadId };
+  const recovery = {
+    id: RunId.make("recovery"),
+    ordinal: 2,
+    providerThreadId,
+    restartContinuationOfRunId: original.id,
+  };
+  expect(ProviderTurnStart.restartContinuationSourceRunId(recovery.id, [original, recovery])).toBe(
+    original.id,
+  );
+});
+
+it.each(["missing", "different owner", "non-ancestor"] as const)(
+  "rejects %s restart continuation ancestry",
+  (reason) => {
+    const providerThreadId = ProviderThreadId.make("retained-chain-thread");
+    const original = {
+      id: RunId.make("original"),
+      ordinal: reason === "non-ancestor" ? 3 : 1,
+      providerThreadId:
+        reason === "different owner" ? ProviderThreadId.make("other-owner") : providerThreadId,
+    };
+    const recovery = {
+      id: RunId.make("recovery"),
+      ordinal: 2,
+      providerThreadId,
+      restartContinuationOfRunId: original.id,
+    };
+    expect(
+      ProviderTurnStart.restartContinuationSourceRunId(
+        recovery.id,
+        reason === "missing" ? [recovery] : [original, recovery],
+      ),
+    ).toBeUndefined();
+  },
+);
+
 it("does not commit running state when inherited background routing cannot be read", async () => {
   const threadId = ThreadId.make("thread_provider_turn_start_projection_failure");
   const runId = RunId.make("run_provider_turn_start_projection_failure");

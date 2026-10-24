@@ -399,6 +399,8 @@ export const ProviderSessionPreparation = Schema.Struct({
   ...PrepareProviderSessionInput.fields,
   receipt: Schema.optional(ProviderSessionPreparationReceipt),
   failure: Schema.optional(SessionPreparationFailureReason),
+  /** Central admission retires the inspection hold before dispatching the genuine turn. */
+  consumedByRunId: Schema.optional(RunId),
 });
 export type ProviderSessionPreparation = typeof ProviderSessionPreparation.Type;
 
@@ -890,6 +892,8 @@ export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
       turnId: TrimmedNonEmptyString,
       nativeTurnId: TrimmedNonEmptyString,
       sequence: NonNegativeInt,
+      /** App run that persisted this identity, separating a continuation chain from stale metadata. */
+      runId: Schema.optional(RunId),
     }),
   ),
   /** Provider-reported selection for display, separate from the app's saved preferences. */

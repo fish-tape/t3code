@@ -4971,7 +4971,7 @@ it.effect("preparation detach prevents a stale turn from reaching the adapter", 
   ),
 );
 
-it.effect("preparation consumes its reservation when the genuine turn is accepted", () =>
+it.effect("preparation allows another turn after its admitted turn and idle release", () =>
   preparationCase((seed, state) =>
     Effect.gen(function* () {
       const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
@@ -5005,6 +5005,123 @@ it.effect("preparation consumes its reservation when the genuine turn is accepte
       yield* Fiber.join(terminal);
       yield* TestClock.adjust("2 minutes");
       assert.isTrue(Option.isNone(yield* manager.get(seed.input.providerSessionId)));
+      const after = (yield* store.getThreadRecords(seed.input.threadId, [])).thread;
+      assert.equal(after.sessionPreparation?.consumedByRunId, "next-genuine-run");
+      const reopened = yield* manager.open({
+        threadId: seed.input.threadId,
+        providerSessionId: seed.input.providerSessionId,
+        modelSelection,
+        runtimePolicy,
+        initialNativeThreadId: seed.input.nativeId,
+        sessionPreparation: after.sessionPreparation!,
+      });
+      const later = yield* preparationTurn(seed, after);
+      yield* reopened.startTurn({ ...later, runId: RunId.make("later-user-run"), runOrdinal: 3 });
+      assert.equal((yield* Ref.get(state)).startCount, 2);
+    }),
+  ),
+);
+
+it.effect("preparation does not require an idle receipt cache to reopen an admitted turn", () =>
+  preparationCase((seed, state) =>
+    Effect.gen(function* () {
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      yield* manager.prepare(seed.input);
+      const thread = (yield* store.getThreadRecords(seed.input.threadId, [])).thread;
+      const runtime = Option.getOrThrow(yield* manager.get(seed.input.providerSessionId));
+      yield* runtime.startTurn(yield* preparationTurn(seed, thread));
+      yield* manager.release({
+        providerSessionId: seed.input.providerSessionId,
+        reason: "server_shutdown",
+      });
+      const after = (yield* store.getThreadRecords(seed.input.threadId, [])).thread;
+      const reopened = yield* manager.open({
+        threadId: seed.input.threadId,
+        providerSessionId: seed.input.providerSessionId,
+        modelSelection,
+        runtimePolicy,
+        initialNativeThreadId: seed.input.nativeId,
+        sessionPreparation: after.sessionPreparation!,
+      });
+      assert.equal(reopened.providerSessionId, seed.input.providerSessionId);
+      assert.equal((yield* Ref.get(state)).openCount, 2);
+    }),
+  ),
+);
+
+it.effect("preparation failure does not hold ordinary work on an unprepared thread", () =>
+  preparationCase(
+    (seed, state) =>
+      Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        yield* manager.prepare(seed.input).pipe(Effect.flip);
+        const thread = (yield* store.getThreadRecords(seed.input.threadId, [])).thread;
+        assert.equal(thread.sessionPreparation?.failure, "attachment_failed");
+        const runtime = yield* manager.open({
+          threadId: seed.input.threadId,
+          providerSessionId: seed.input.providerSessionId,
+          modelSelection,
+          runtimePolicy,
+          sessionPreparation: thread.sessionPreparation!,
+        });
+        yield* runtime.startTurn(yield* preparationTurn(seed, thread));
+        assert.equal((yield* Ref.get(state)).startCount, 1);
+      }),
+    { fail: true },
+  ),
+);
+
+it.effect("preparation can refresh an expired hold after a run was rejected before admission", () =>
+  preparationCase((seed, state, calls) =>
+    Effect.gen(function* () {
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const ids = yield* IdAllocator.IdAllocatorV2;
+      yield* manager.prepare(seed.input);
+      yield* manager.release({
+        providerSessionId: seed.input.providerSessionId,
+        reason: "manual_shutdown",
+      });
+      const thread = (yield* store.getThreadRecords(seed.input.threadId, [])).thread;
+      const rejected = yield* manager
+        .open({
+          threadId: seed.input.threadId,
+          providerSessionId: seed.input.providerSessionId,
+          modelSelection,
+          runtimePolicy,
+          sessionPreparation: thread.sessionPreparation!,
+        })
+        .pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(rejected));
+      const runId = RunId.make("rejected-before-native-admission");
+      yield* sink.write({
+        events: [
+          {
+            id: yield* ids.allocate.event({ threadId: seed.input.threadId }),
+            threadId: seed.input.threadId,
+            type: "run.created",
+            occurredAt: seed.now,
+            payload: {
+              ...seed.run,
+              id: runId,
+              ordinal: 2,
+              status: "failed",
+              rootNodeId: ids.derive.rootNode({ runId }),
+              activeAttemptId: ids.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+            },
+          },
+        ],
+      });
+      const next = yield* manager.prepare({
+        ...seed.input,
+        requestId: CommandId.make("fresh-preparation-after-rejection"),
+      });
+      assert.equal(next.requestId, "fresh-preparation-after-rejection");
+      assert.equal(yield* Ref.get(calls), 2);
+      assert.equal((yield* Ref.get(state)).startCount, 0);
     }),
   ),
 );

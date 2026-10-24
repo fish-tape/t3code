@@ -2092,7 +2092,7 @@ export function makeAcpAdapterV2(
         ): AcpAdapterV2RuntimeInput => {
           const mcpContext = acpMcpContext(threadId, self);
           return {
-            ...(input.preparationRequestId === undefined
+            ...(!preparedRetainedSession || input.preparationRequestId === undefined
               ? {}
               : {
                   sessionPreparation: { requestId: input.preparationRequestId },
@@ -7077,6 +7077,7 @@ export function makeAcpAdapterV2(
                       turnId: durableTurn.turnId,
                       nativeTurnId: durableTurn.nativeTurnId,
                       sequence: durableTurn.sequence,
+                      runId: turnInput.runId,
                     },
                   };
             if (initialNativeMetadata !== null) {
@@ -7273,14 +7274,13 @@ export function makeAcpAdapterV2(
                     },
                   }),
             };
+            if (prepared !== undefined && preparedBinding !== undefined) {
+              // End the inspection window at genuine turn admission. The captured
+              // payload still checks request/generation atomically at the controller.
+              preparedBinding.consumed = true;
+              preparedRetainedSession = false;
+            }
             yield* runtime.prompt(promptPayload).pipe(
-              Effect.tap(() =>
-                Effect.sync(() => {
-                  if (preparedBinding?.requestId === prepared?.requestId && preparedBinding) {
-                    preparedBinding.consumed = true;
-                  }
-                }),
-              ),
               Effect.tap(() =>
                 Ref.update(promptInstructionStates, (current) => {
                   if (promptParts?.instructionState === undefined) return current;
@@ -7335,7 +7335,10 @@ export function makeAcpAdapterV2(
                   promptGeneration,
                   Effect.gen(function* () {
                     // An uncertain prompt cannot reuse preparation for another attempt.
-                    if (prepared !== undefined) preparedBinding = undefined;
+                    if (prepared !== undefined) {
+                      preparedBinding = undefined;
+                      preparedRetainedSession = !context.interrupted;
+                    }
                     if (context.finalized) return;
                     yield* finalizeTurn(
                       context,
@@ -7529,7 +7532,6 @@ export function makeAcpAdapterV2(
                   });
                 }
                 const sessionId = yield* nativeThreadId(driver, preparation.providerThread);
-                preparedRetainedSession = true;
                 // Strict eager activation already applied this request. Retrying it is read-only.
                 const activated =
                   input.preparationRequestId === preparation.requestId

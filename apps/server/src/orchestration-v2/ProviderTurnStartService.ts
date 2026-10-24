@@ -65,6 +65,28 @@ export class ProviderTurnStartError extends Schema.TaggedError<ProviderTurnStart
 
 const isProviderTurnStartError = Schema.is(ProviderTurnStartError);
 
+/** Native work belongs to the original run, including when a recovery crashes before its cursor commits. */
+export function restartContinuationSourceRunId(
+  runId: RunId,
+  runs: ReadonlyArray<
+    Pick<OrchestrationV2Run, "id" | "ordinal" | "providerThreadId" | "restartContinuationOfRunId">
+  >,
+): RunId | undefined {
+  const byId = new Map(runs.map((run) => [run.id, run]));
+  let current = byId.get(runId);
+  while (current?.restartContinuationOfRunId !== undefined) {
+    const parent = byId.get(current.restartContinuationOfRunId);
+    if (
+      parent === undefined ||
+      parent.providerThreadId !== current.providerThreadId ||
+      parent.ordinal >= current.ordinal
+    )
+      return;
+    current = parent;
+  }
+  return current?.id;
+}
+
 /** Claude refuses to replace a process running background work before it reads the prompt. */
 const refusedBeforePrompt = (error: unknown): boolean =>
   Predicate.isTagged(error, "ClaudeBackgroundWorkBlocksQueryReplacementError") ||
@@ -535,7 +557,7 @@ export const layer: Layer.Layer<
           providerSessionId,
           modelSelection: run.modelSelection,
           runtimePolicy: resolvedRuntimePolicy,
-          ...(projection.thread.sessionPreparation === undefined
+          ...(!ProviderSessionManager.requiresLivePreparation(projection.thread.sessionPreparation)
             ? {}
             : {
                 sessionPreparation: projection.thread.sessionPreparation,
@@ -696,7 +718,7 @@ export const layer: Layer.Layer<
           return resumed.success;
         }
 
-        if (projection.thread.sessionPreparation !== undefined) {
+        if (ProviderSessionManager.requiresLivePreparation(projection.thread.sessionPreparation)) {
           return yield* loadFromProvider(Effect.fail(resumed.failure));
         }
 
@@ -1191,8 +1213,21 @@ export const layer: Layer.Layer<
             .join("\n\n");
           // A note continuation has no turn to resume; its text is the prompt.
           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
+          const originalRunId =
+            _resumedRunId === undefined || noteContinuation
+              ? undefined
+              : restartContinuationSourceRunId(_resumedRunId, projection.runs);
+          if (_resumedRunId !== undefined && !noteContinuation && originalRunId === undefined)
+            return yield* new ProviderAdapterTurnStartError({
+              driver: session.driver,
+              threadId: turnInput.threadId,
+              providerThreadId: turnInput.providerThread.id,
+              runId,
+              cause: "Restart continuation ancestry is missing or changed",
+            });
           yield* start({
             ...(noteContinuation ? promptedInput : turnInput),
+            ...(originalRunId === undefined ? {} : { restartContinuationOfRunId: originalRunId }),
             message: {
               ...turnInput.message,
               text: context === "" ? userText : `${context}\n\nUser message:\n${userText}`,

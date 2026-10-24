@@ -99,10 +99,13 @@ Preparation reserves the attachment for inspection without keeping it alive thro
 synthetic prompts. The reservation ends when a genuine turn is accepted or the
 operator uses normal detach/release. That next turn carries the same request and
 expected generation. Both T3 and the controller reject a stale marker before native
-dispatch. After the first prompt succeeds, later turns on that same attachment do
-not replay its consumed marker; an uncertain prompt requires preparation again.
-Detach, idle release after the genuine turn, restart, recovery or any
-attachment/binding change requires fresh preparation. Retrying a current request
+dispatch. Central admission retires the hold durably before dispatch, so a restart
+can reattach to accepted work without demanding an idle preparation. Later turns
+and ordinary cleanup do not reuse that consumed marker. An uncertain native prompt
+remains held by the adapter. Before admission, detach, release, restart or any
+attachment/binding change invalidates readiness and requires fresh preparation.
+A failed preparation does not create a hold on an otherwise ordinary thread.
+Retrying a current request
 returns its receipt without reapplying the toolkit; an expired request cannot be
 replayed into a new attachment.
 

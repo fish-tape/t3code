@@ -1,4 +1,5 @@
 import { assert, it } from "@effect/vitest";
+import { RunId } from "@t3tools/contracts";
 import {
   acpDurableTurn,
   acpDurableDelivery,
@@ -12,13 +13,13 @@ it("retains the original remote turn through repeated restart continuations", ()
     sessionId: "session",
     runId: "recovery-1",
     restartContinuationOfRunId: "original",
-    metadata: { acpDurablePrompt: { ...first, sequence: 42 } },
+    metadata: { acpDurablePrompt: { ...first, runId: RunId.make("original"), sequence: 42 } },
   });
   const repeated = acpDurableTurn({
     sessionId: "session",
     runId: "recovery-2",
     restartContinuationOfRunId: "recovery-1",
-    metadata: { acpDurablePrompt: resumed },
+    metadata: { acpDurablePrompt: { ...resumed, runId: RunId.make("recovery-1") } },
   });
   assert.deepEqual(repeated, resumed);
   assert.equal(repeated.nativeTurnId, first.nativeTurnId);
@@ -27,6 +28,24 @@ it("retains the original remote turn through repeated restart continuations", ()
       .sequence,
     0,
   );
+});
+it("attaches to the interrupted run when the saved cursor belongs to an older turn", () => {
+  const resumed = acpDurableTurn({
+    sessionId: "session",
+    runId: "recovery",
+    restartContinuationOfRunId: "accepted-new-turn",
+    metadata: {
+      acpDurablePrompt: {
+        turnId: "older-completed-turn",
+        nativeTurnId: "session:durable:older-completed-turn",
+        runId: RunId.make("older-completed-turn"),
+        sequence: 42,
+      },
+    },
+  });
+  assert.equal(resumed.turnId, "accepted-new-turn");
+  assert.equal(resumed.nativeTurnId, "session:durable:accepted-new-turn");
+  assert.equal(resumed.sequence, 0);
 });
 it("negotiates version 1 and rejects malformed delivery cursors", () => {
   const key = "io.t3code/durable-prompt";

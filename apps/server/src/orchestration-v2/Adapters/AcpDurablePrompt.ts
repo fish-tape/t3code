@@ -31,11 +31,19 @@ export function acpDurableTurn(input: {
 }) {
   const previous = input.metadata?.acpDurablePrompt;
   const attach = input.restartContinuationOfRunId !== undefined;
-  const turnId = attach ? (previous?.turnId ?? input.restartContinuationOfRunId!) : input.runId;
+  const sameChain =
+    attach &&
+    (previous?.runId === input.restartContinuationOfRunId ||
+      previous?.turnId === input.restartContinuationOfRunId);
+  const turnId = attach
+    ? sameChain
+      ? previous!.turnId
+      : input.restartContinuationOfRunId!
+    : input.runId;
   return {
     turnId,
     nativeTurnId: `${input.sessionId}:durable:${turnId}`,
-    sequence: attach ? (previous?.sequence ?? 0) : 0,
+    sequence: sameChain ? previous!.sequence : 0,
     attach,
   };
 }

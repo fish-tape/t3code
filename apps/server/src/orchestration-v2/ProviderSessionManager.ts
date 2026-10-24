@@ -73,6 +73,13 @@ const busyTurnPrefix = (providerThreadId: ProviderThreadId) => `${providerThread
 const busyTurnKey = (providerThreadId: ProviderThreadId, runOrdinal: number) =>
   `${busyTurnPrefix(providerThreadId)}${runOrdinal}`;
 const UNLOAD_THREAD_TIMEOUT_MS = 10 * 1000;
+const isProviderAdapterTurnStartError = Schema.is(ProviderAdapterTurnStartError);
+const isPrepareProviderSessionError = Schema.is(PrepareProviderSessionError);
+
+export const requiresLivePreparation = (
+  marker: ProviderSessionPreparation | undefined,
+): marker is ProviderSessionPreparation =>
+  marker !== undefined && marker.failure === undefined && marker.consumedByRunId === undefined;
 
 export const ProviderSessionReleaseReason = Schema.Literals([
   "idle_timeout",
@@ -423,6 +430,7 @@ export const layerWithOptions = (
             current.thread.sessionPreparation?.requestId !== input.requestId ||
             current.thread.sessionPreparation.receipt?.attachmentId !==
               input.receipt.attachmentId ||
+            current.thread.sessionPreparation.consumedByRunId !== undefined ||
             bound?.providerSessionId !== input.providerSessionId ||
             bound.nativeThreadRef?.nativeId !== input.nativeId ||
             bound.appThreadId !== input.threadId
@@ -1924,22 +1932,52 @@ export const layerWithOptions = (
               ),
             ),
           startTurn: (input) =>
-            (input.appThread.sessionPreparation === undefined
+            (!requiresLivePreparation(input.appThread.sessionPreparation)
               ? Effect.void
-              : preparationIsLive(input.appThread.sessionPreparation).pipe(
-                  Effect.flatMap((live) =>
-                    live
-                      ? Effect.void
-                      : Effect.fail(
-                          new ProviderAdapterTurnStartError({
+              : threadCommands.withLock(
+                  input.threadId,
+                  Effect.gen(function* () {
+                    const marker = input.appThread.sessionPreparation!;
+                    if (!(yield* preparationIsLive(marker))) {
+                      return yield* new ProviderAdapterTurnStartError({
+                        driver: runtime.driver,
+                        threadId: input.threadId,
+                        providerThreadId: input.providerThread.id,
+                        runId: input.runId,
+                        cause:
+                          "Retained session preparation expired; prepare again before continuing.",
+                      });
+                    }
+                    const records = yield* projectionStore.getThreadRecords(input.threadId, []);
+                    // Persist admission before the adapter can dispatch. Recovery
+                    // may then attach to this run without demanding idle preparation
+                    // while the same accepted native work is still running.
+                    yield* eventSink.write({
+                      events: [
+                        {
+                          id: yield* idAllocator.allocate.event({ threadId: input.threadId }),
+                          threadId: input.threadId,
+                          type: "thread.metadata-updated",
+                          occurredAt: yield* DateTime.now,
+                          payload: {
+                            ...records.thread,
+                            sessionPreparation: { ...marker, consumedByRunId: input.runId },
+                          },
+                        },
+                      ],
+                    });
+                  }).pipe(
+                    Effect.mapError((cause) =>
+                      isProviderAdapterTurnStartError(cause)
+                        ? cause
+                        : new ProviderAdapterTurnStartError({
                             driver: runtime.driver,
                             threadId: input.threadId,
                             providerThreadId: input.providerThread.id,
                             runId: input.runId,
-                            cause:
-                              "Retained session preparation expired; prepare again before continuing.",
+                            cause,
                           }),
-                        ),
+                    ),
                   ),
                 )
             ).pipe(
@@ -2198,16 +2236,32 @@ export const layerWithOptions = (
                 new PrepareProviderSessionError({ threadId: input.threadId, reason });
               const inspect = Effect.gen(function* () {
                 const current = yield* projectionStore.getRuntimeRecoveryProjection(input.threadId);
-                // Recovery projections omit stopped/idle bindings. Read the roster too,
-                // without loading conversation history or private provider metadata.
+                // Recovery projections omit stopped bindings and older completed
+                // runs. Read their records without loading conversation history.
                 const records = yield* projectionStore.getThreadRecords(input.threadId, [
                   "providerSessions",
                   "providerThreads",
+                  "runs",
                 ]);
                 const providerThread = records.providerThreads.find(
                   (row) => row.id === input.providerThreadId,
                 );
-                const latest = current.runs.at(-1);
+                const latest = records.runs.at(-1);
+                const marker = current.thread.sessionPreparation;
+                const completed = records.runs.find((run) => run.id === input.completedRunId);
+                // An expired hold can reject an app run before dispatch. Every
+                // genuine admission first retires the marker durably, so an
+                // unconsumed marker proves these later failed runs sent no prompt.
+                const rejectedBeforeAdmission =
+                  requiresLivePreparation(marker) &&
+                  marker.completedRunId === input.completedRunId &&
+                  marker.providerThreadId === input.providerThreadId &&
+                  marker.providerSessionId === input.providerSessionId &&
+                  marker.nativeId === input.nativeId &&
+                  completed?.status === "completed" &&
+                  records.runs
+                    .filter((run) => run.ordinal > completed.ordinal)
+                    .every((run) => run.status === "failed" || run.status === "cancelled");
                 const session = records.providerSessions.find(
                   (row) => row.id === input.providerSessionId,
                 );
@@ -2219,8 +2273,11 @@ export const layerWithOptions = (
                   providerThread.ownerNodeId !== null ||
                   providerThread.providerSessionId !== input.providerSessionId ||
                   providerThread.nativeThreadRef?.nativeId !== input.nativeId ||
-                  latest?.id !== input.completedRunId ||
-                  latest.status !== "completed" ||
+                  latest === undefined ||
+                  !(
+                    (latest.id === input.completedRunId && latest.status === "completed") ||
+                    rejectedBeforeAdmission
+                  ) ||
                   latest.providerThreadId !== input.providerThreadId ||
                   session === undefined ||
                   session.driver !== providerThread.driver ||
@@ -2396,13 +2453,12 @@ export const layerWithOptions = (
             }).pipe(
               Effect.catch((cause) =>
                 Effect.gen(function* () {
-                  const error =
-                    cause instanceof PrepareProviderSessionError
-                      ? cause
-                      : new PrepareProviderSessionError({
-                          threadId: input.threadId,
-                          reason: "attachment_failed",
-                        });
+                  const error = isPrepareProviderSessionError(cause)
+                    ? cause
+                    : new PrepareProviderSessionError({
+                        threadId: input.threadId,
+                        reason: "attachment_failed",
+                      });
                   // Persist only a bounded outcome, under the same ownership lock. A
                   // retry of a failed request must not load or apply credentials again.
                   yield* Effect.gen(function* () {
@@ -2454,7 +2510,7 @@ export const layerWithOptions = (
                 });
               }
               if (
-                input.sessionPreparation !== undefined &&
+                requiresLivePreparation(input.sessionPreparation) &&
                 (input.providerSessionId !== input.sessionPreparation.providerSessionId ||
                   input.threadId !== input.sessionPreparation.threadId ||
                   !(yield* preparationIsLive(input.sessionPreparation)))
