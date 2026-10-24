@@ -14959,11 +14959,95 @@ it.live("preparation explicitly reattaches the held operation on the same warm r
     assert.deepEqual(payloads[1]?._meta?.["io.t3code/durable-prompt"], {
       turnId: first.runId,
       attach: true,
+      reconcilePreparation: {
+        requestId: first.appThread.sessionPreparation!.requestId,
+        expectedGeneration: first.appThread.sessionPreparation!.receipt!.nativeSession.generation,
+      },
     });
     assert.deepEqual(outcomes, ["completed"]);
     assert.lengthOf(payloads, 2);
     assert.notInclude(yield* pollProtocolMethods(fixture.protocolEvents), "session/new");
   }).pipe(Effect.provide(layerTest), Effect.scoped),
+);
+
+it.live.each(["fenced", "unknown", "wrong-turn"] as const)(
+  "preparation held reattachment settles only its certified absent turn (%s)",
+  (outcome) =>
+    Effect.gen(function* () {
+      const payloads: Parameters<AcpSessionRuntime.AcpSessionRuntime["Service"]["prompt"]>[0][] =
+        [];
+      let root = "";
+      const fixture = yield* makePreparationAdapter(
+        { T3_ACP_SESSION_PREPARATION: "1" },
+        {
+          wrapRuntime: (runtime) => ({
+            ...runtime,
+            prompt: (payload) =>
+              Effect.suspend(() => {
+                payloads.push(payload);
+                return Effect.fail(
+                  new EffectAcpErrors.AcpTransportError({
+                    detail: "retained turn response",
+                    cause:
+                      payloads.length === 1 || outcome === "unknown"
+                        ? { code: -32097 }
+                        : {
+                            code: -32097,
+                            data: {
+                              kind: "retained_dispatch",
+                              dispatch: "rejected",
+                              turnId: outcome === "wrong-turn" ? "another" : root,
+                            },
+                          },
+                  }),
+                );
+              }),
+          }),
+        },
+      );
+      const runtime = yield* fixture.open;
+      const first = yield* preparedMockTurn(fixture, runtime);
+      root = first.runId;
+      const results: string[] = [];
+      const lifecycle = {
+        beforePrompt: () => Effect.void,
+        result: (value: "completed" | "rejected") =>
+          Effect.sync(() => {
+            results.push(value);
+          }),
+      };
+      yield* runtime.startTurn({ ...first, preparationLifecycle: lifecycle });
+      yield* runtime.events.pipe(
+        Stream.takeUntil((event) => event.type === "turn.terminal"),
+        Stream.runDrain,
+      );
+      const retry = makeTurnInput({
+        ...fixture,
+        providerThread: first.providerThread,
+        now: yield* DateTime.now,
+        ordinal: 2,
+      });
+      yield* runtime.startTurn({
+        ...retry,
+        appThread: {
+          ...first.appThread,
+          sessionPreparation: {
+            ...first.appThread.sessionPreparation!,
+            dispatchingRunId: first.runId,
+            holdRequired: true,
+          },
+        },
+        restartContinuationOfRunId: first.runId,
+        preparationLifecycle: lifecycle,
+      });
+      yield* runtime.events.pipe(
+        Stream.takeUntil((event) => event.type === "turn.terminal"),
+        Stream.runDrain,
+      );
+      assert.deepEqual(results, outcome === "fenced" ? ["rejected"] : []);
+      assert.lengthOf(payloads, 2);
+      assert.notInclude(yield* pollProtocolMethods(fixture.protocolEvents), "session/new");
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
 );
 
 it.live(

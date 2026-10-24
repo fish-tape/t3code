@@ -105,6 +105,7 @@ import {
   decodeSessionPreparation,
   supportsSessionPreparation,
   sessionPreparationRejected,
+  retainedDispatchRejected,
 } from "../../provider/acp/AcpSessionPreparation.ts";
 import {
   t3AcpPromptWithInstructions,
@@ -7298,6 +7299,14 @@ export function makeAcpAdapterV2(
                             [ACP_DURABLE_PROMPT]: {
                               turnId: durableTurn.turnId,
                               ...(durableTurn.attach ? { attach: true } : {}),
+                              ...(retainedAttach && marker?.receipt !== undefined
+                                ? {
+                                    reconcilePreparation: {
+                                      requestId: marker.requestId,
+                                      expectedGeneration: marker.receipt.nativeSession.generation,
+                                    },
+                                  }
+                                : {}),
                             },
                           }),
                     },
@@ -7380,9 +7389,18 @@ export function makeAcpAdapterV2(
                   promptGeneration,
                   Effect.gen(function* () {
                     // An uncertain prompt cannot reuse preparation for another attempt.
-                    if (prepared !== undefined) {
-                      if (sessionPreparationRejected(Cause.squash(cause)))
-                        yield* settlePreparation("rejected");
+                    const rejected =
+                      (prepared !== undefined &&
+                        !retainedAttach &&
+                        sessionPreparationRejected(Cause.squash(cause))) ||
+                      (durableTurn !== undefined &&
+                        retainedDispatchRejected(Cause.squash(cause), durableTurn.turnId));
+                    if (rejected) {
+                      yield* settlePreparation("rejected");
+                      preparedBinding = undefined;
+                      preparedRetainedSession = false;
+                      retainedDispatchAttachment = false;
+                    } else if (prepared !== undefined) {
                       preparedBinding = undefined;
                       preparedRetainedSession = true;
                     }

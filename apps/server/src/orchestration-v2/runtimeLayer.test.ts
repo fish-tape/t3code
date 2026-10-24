@@ -3234,7 +3234,6 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
               occurredAt: now,
               payload: {
                 ...projection.thread,
-                activeRunId: null,
                 activeProviderThreadId: providerThreadId,
                 sessionPreparation: {
                   requestId: CommandId.make(`${threadId}:prepare`),

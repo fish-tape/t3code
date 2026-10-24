@@ -27,13 +27,38 @@ const isRejectedPrompt = Schema.is(
 );
 
 /** A controller-certified pre-dispatch rejection; generic errors remain uncertain. */
-export function sessionPreparationRejected(error: unknown): boolean {
+export function sessionPreparationRejected(error: unknown, depth = 0): boolean {
   if (isRejectedPrompt(error)) return true;
   return (
     typeof error === "object" &&
     error !== null &&
     "cause" in error &&
     error.cause !== error &&
-    sessionPreparationRejected(error.cause)
+    depth < 8 &&
+    sessionPreparationRejected(error.cause, depth + 1)
+  );
+}
+
+const isRejectedRetainedDispatch = Schema.is(
+  Schema.Struct({
+    code: Schema.Literal(-32097),
+    data: Schema.Struct({
+      kind: Schema.Literal("retained_dispatch"),
+      dispatch: Schema.Literal("rejected"),
+      turnId: Schema.String,
+    }),
+  }),
+);
+
+/** Only an authenticated, durable fence for this exact original turn releases its hold. */
+export function retainedDispatchRejected(error: unknown, turnId: string, depth = 0): boolean {
+  if (isRejectedRetainedDispatch(error)) return error.data.turnId === turnId;
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "cause" in error &&
+    error.cause !== error &&
+    depth < 8 &&
+    retainedDispatchRejected(error.cause, turnId, depth + 1)
   );
 }

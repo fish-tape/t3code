@@ -118,10 +118,32 @@ The text labels the recovery in the app; durable ACP sends an attach for the
 original operation, never that text as a new native prompt. This also handles a
 failed app run and a crash before the provider's running event committed. Exact
 current strong binding, no pending requests or competing work are required.
-Later messages rejected by this hold do not hide its original operation. Unknown
-or unavailable retained outcomes remain held; there is no blind replay or database
-edit procedure. A stopped run is reattached only by this explicit command;
+Later messages rejected by this hold do not hide its original operation. If the
+controller has no recorded turn, attach includes the original preparation request
+and generation for authenticated absence reconciliation. Only a same-generation,
+idle controller with no competing preparation or pending requests may durably
+fence that exact turn ID, then certify `{kind:"retained_dispatch", dispatch:"rejected", turnId}`.
+The fence prevents a delayed original request from ever starting. T3 matches the
+exact root turn ID before clearing dispatch intent, then requires fresh preparation
+and a new genuine turn ID. Retrying reconciliation retrieves the same proof if
+central settlement failed; there need not be a retained completion. A journaled
+turn, changed generation, unavailable controller or missing proof remains held.
+An older controller without reconciliation support fails held. There is no blind
+replay or database edit procedure. A stopped run is reattached only by this explicit command;
 automatic restart deliveries keep their Stop exclusions.
+
+If the owned local ACP bridge exited, first inspect the complete current history
+and confirm all app/provider turns are terminal, no queued work or pending requests
+exist, and the provider session still belongs to this thread. An explicitly
+authorized `provider-session.detach` command through `orchestration.dispatchCommand`
+can release that local attachment before the attach-only recovery above. For the
+retained-dispatch runtime, cleanup is transport-only; it sends no native close,
+cancel, permission response or lifecycle recovery. The dispatch hold persists.
+Do not use this procedure on active or uncertain live-owner work, or treat a
+successful local detach as controller completion. A cold attach still requires
+the exact retained binding and never substitutes a new session. Attach-only runs
+also do not count as delivery of a restart's lost-background-work note; the next
+ordinary prompt still owes that note.
 
 After settlement, later turns and ordinary cleanup do not reuse the consumed
 marker. Before dispatch, detach, release, restart or any attachment/binding change
