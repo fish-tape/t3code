@@ -1,6 +1,7 @@
 import { expect, it, vi } from "vite-plus/test";
 import { it as effectIt } from "@effect/vitest";
 import {
+  CommandId,
   CheckpointScopeId,
   MessageId,
   NodeId,
@@ -39,6 +40,45 @@ import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 
 const isDomainEvent = Schema.is(OrchestrationV2DomainEvent);
+
+it("retains the original run when a recovery crashes before its cursor commits", () => {
+  const providerThreadId = ProviderThreadId.make("retained-chain-thread");
+  const original = { id: RunId.make("original"), ordinal: 1, providerThreadId };
+  const recovery = {
+    id: RunId.make("recovery"),
+    ordinal: 2,
+    providerThreadId,
+    restartContinuationOfRunId: original.id,
+  };
+  expect(ProviderTurnStart.restartContinuationSourceRunId(recovery.id, [original, recovery])).toBe(
+    original.id,
+  );
+});
+
+it.each(["missing", "different owner", "non-ancestor"] as const)(
+  "rejects %s restart continuation ancestry",
+  (reason) => {
+    const providerThreadId = ProviderThreadId.make("retained-chain-thread");
+    const original = {
+      id: RunId.make("original"),
+      ordinal: reason === "non-ancestor" ? 3 : 1,
+      providerThreadId:
+        reason === "different owner" ? ProviderThreadId.make("other-owner") : providerThreadId,
+    };
+    const recovery = {
+      id: RunId.make("recovery"),
+      ordinal: 2,
+      providerThreadId,
+      restartContinuationOfRunId: original.id,
+    };
+    expect(
+      ProviderTurnStart.restartContinuationSourceRunId(
+        recovery.id,
+        reason === "missing" ? [recovery] : [original, recovery],
+      ),
+    ).toBeUndefined();
+  },
+);
 
 it("does not commit running state when inherited background routing cannot be read", async () => {
   const threadId = ThreadId.make("thread_provider_turn_start_projection_failure");
@@ -166,6 +206,8 @@ function makeLocalCommandHarness(input: {
    * fallback succeeds, then reading history for its handoff fails.
    */
   readonly historyReadFailureAfterFallback?: unknown;
+  readonly durableRestart?: boolean;
+  readonly prepared?: boolean;
   readonly interruptOpen?: boolean;
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
@@ -187,6 +229,9 @@ function makeLocalCommandHarness(input: {
   const run: OrchestrationV2ThreadProjection["runs"][number] = {
     id: runId,
     threadId,
+    ...(input.durableRestart
+      ? { restartContinuationOfRunId: RunId.make("original-durable-run") }
+      : {}),
     ordinal: 2,
     providerInstanceId: newInstanceId,
     modelSelection: { instanceId: newInstanceId, model: "gpt-5.4" },
@@ -351,7 +396,23 @@ function makeLocalCommandHarness(input: {
     projection = {
       ...projection,
       providerThreads: projection.providerThreads.map((candidate) =>
-        candidate.id === providerThreadId ? { ...candidate, nativeThreadRef } : candidate,
+        candidate.id === providerThreadId
+          ? {
+              ...candidate,
+              nativeThreadRef,
+              ...(input.durableRestart
+                ? {
+                    nativeMetadata: {
+                      acpDurablePrompt: {
+                        turnId: "original-durable-run",
+                        nativeTurnId: "native-durable-turn",
+                        sequence: 10,
+                      },
+                    },
+                  }
+                : {}),
+            }
+          : candidate,
       ),
     };
   }
@@ -381,6 +442,23 @@ function makeLocalCommandHarness(input: {
       ),
     ),
   );
+  if (input.prepared) {
+    projection = {
+      ...projection,
+      thread: {
+        ...projection.thread,
+        sessionPreparation: {
+          requestId: CommandId.make("prepared-request"),
+          threadId,
+          providerThreadId,
+          providerSessionId,
+          nativeId: "native-resume-thread",
+          completedRunId: RunId.make("completed-run"),
+        },
+      },
+    };
+  }
+  const resumeFallbackEnsureThread = vi.fn(() => Effect.succeed(providerThread));
   const resumeFallbackSession = {
     driver: providerThread.driver,
     resumeThread: () =>
@@ -391,7 +469,7 @@ function makeLocalCommandHarness(input: {
           cause: "native thread is gone",
         }),
       ),
-    ensureThread: () => Effect.succeed(providerThread),
+    ensureThread: resumeFallbackEnsureThread,
   };
   const open = vi.fn(() =>
     input.interruptOpen === true
@@ -543,6 +621,7 @@ function makeLocalCommandHarness(input: {
     start: Effect.gen(function* () {
       yield* (yield* ProviderTurnStart.ProviderTurnStartServiceV2).start({ threadId, runId });
     }).pipe(Effect.provide(layer)),
+    resumeFallbackEnsureThread,
     startWithRetry: Effect.gen(function* () {
       yield* (yield* ProviderTurnStart.ProviderTurnStartServiceV2).start({
         threadId,
@@ -855,3 +934,32 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
       }),
   );
 }
+
+effectIt.effect(
+  "fails a durable restart when resume is unavailable instead of creating fresh work",
+  () =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        durableRestart: true,
+        historyReadFailureAfterFallback: new Error("must never read fallback history"),
+      });
+      yield* harness.start;
+      expect(harness.resumeFallbackEnsureThread).not.toHaveBeenCalled();
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+    }),
+);
+
+effectIt.effect("preparation forbids the later null-native fresh-thread fallback", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      prepared: true,
+      historyReadFailureAfterFallback: new Error("must never read fallback history"),
+    });
+    yield* harness.start;
+    expect(harness.resumeFallbackEnsureThread).not.toHaveBeenCalled();
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+  }),
+);

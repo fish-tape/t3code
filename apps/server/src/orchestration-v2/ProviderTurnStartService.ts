@@ -65,6 +65,28 @@ export class ProviderTurnStartError extends Schema.TaggedError<ProviderTurnStart
 
 const isProviderTurnStartError = Schema.is(ProviderTurnStartError);
 
+/** Native work belongs to the original run, including when a recovery crashes before its cursor commits. */
+export function restartContinuationSourceRunId(
+  runId: RunId,
+  runs: ReadonlyArray<
+    Pick<OrchestrationV2Run, "id" | "ordinal" | "providerThreadId" | "restartContinuationOfRunId">
+  >,
+): RunId | undefined {
+  const byId = new Map(runs.map((run) => [run.id, run]));
+  let current = byId.get(runId);
+  while (current?.restartContinuationOfRunId !== undefined) {
+    const parent = byId.get(current.restartContinuationOfRunId);
+    if (
+      parent === undefined ||
+      parent.providerThreadId !== current.providerThreadId ||
+      parent.ordinal >= current.ordinal
+    )
+      return;
+    current = parent;
+  }
+  return current?.id;
+}
+
 /** Claude refuses to replace a process running background work before it reads the prompt. */
 const refusedBeforePrompt = (error: unknown): boolean =>
   Predicate.isTagged(error, "ClaudeBackgroundWorkBlocksQueryReplacementError") ||
@@ -529,12 +551,29 @@ export const layer: Layer.Layer<
       const existingSessionProjection = projection.providerSessions.find(
         (candidate) => candidate.id === providerSessionId,
       );
+      const retainedContinuationSource =
+        run.restartContinuationOfRunId === undefined
+          ? undefined
+          : restartContinuationSourceRunId(run.restartContinuationOfRunId, projection.runs);
+      const reattachingHeldDispatch =
+        retainedContinuationSource !== undefined &&
+        projection.thread.sessionPreparation?.dispatchingRunId === retainedContinuationSource;
       const sessionResult = yield* Effect.result(
         providerSessions.open({
           threadId: projection.thread.id,
           providerSessionId,
           modelSelection: run.modelSelection,
           runtimePolicy: resolvedRuntimePolicy,
+          ...(!ProviderSessionManager.requiresLivePreparation(projection.thread.sessionPreparation)
+            ? {}
+            : {
+                sessionPreparation: projection.thread.sessionPreparation,
+                ...(retainedContinuationSource === undefined
+                  ? {}
+                  : {
+                      restartContinuationOfRunId: retainedContinuationSource,
+                    }),
+              }),
           ...(existingSessionProjection === undefined
             ? {}
             : { resumeFromSession: existingSessionProjection }),
@@ -691,6 +730,16 @@ export const layer: Layer.Layer<
           return resumed.success;
         }
 
+        if (ProviderSessionManager.requiresLivePreparation(projection.thread.sessionPreparation)) {
+          return yield* loadFromProvider(Effect.fail(resumed.failure));
+        }
+
+        if (
+          run.restartContinuationOfRunId !== undefined &&
+          providerThread.nativeMetadata?.acpDurablePrompt !== undefined
+        ) {
+          return yield* loadFromProvider(Effect.fail(resumed.failure));
+        }
         yield* Effect.logWarning("Provider resume failed; attempting a fresh native session", {
           driver: session.driver,
           providerThreadId: providerThread.id,
@@ -844,6 +893,7 @@ export const layer: Layer.Layer<
         ...run,
         status: "running",
         startedAt: now,
+        ...(reattachingHeldDispatch ? { retainedDispatchOfRunId: retainedContinuationSource } : {}),
       };
       const runningAttempt: OrchestrationV2RunAttempt = {
         ...attempt,
@@ -956,12 +1006,16 @@ export const layer: Layer.Layer<
       });
       // Delivered once: this run's provider turn marks the work as told. A
       // restart continuation is prompted by its own text or resumes natively.
-      const noteContinuation = isRestartNoteContinuation(
-        run,
-        projection.runs,
-        projection.providerTurns,
-        projection.attempts,
-      );
+      // A retained operation must be joined even when recovery recorded lost
+      // background work. Its note cannot turn that attach into a new prompt.
+      const noteContinuation =
+        !reattachingHeldDispatch &&
+        isRestartNoteContinuation(
+          run,
+          projection.runs,
+          projection.providerTurns,
+          projection.attempts,
+        );
       const restartCancelledWork = pendingRestartCancelledBackgroundWork({
         runs: projection.runs,
         providerTurns: projection.providerTurns,
@@ -1176,8 +1230,21 @@ export const layer: Layer.Layer<
             .join("\n\n");
           // A note continuation has no turn to resume; its text is the prompt.
           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
+          const originalRunId =
+            _resumedRunId === undefined || noteContinuation
+              ? undefined
+              : restartContinuationSourceRunId(_resumedRunId, projection.runs);
+          if (_resumedRunId !== undefined && !noteContinuation && originalRunId === undefined)
+            return yield* new ProviderAdapterTurnStartError({
+              driver: session.driver,
+              threadId: turnInput.threadId,
+              providerThreadId: turnInput.providerThread.id,
+              runId,
+              cause: "Restart continuation ancestry is missing or changed",
+            });
           yield* start({
             ...(noteContinuation ? promptedInput : turnInput),
+            ...(originalRunId === undefined ? {} : { restartContinuationOfRunId: originalRunId }),
             message: {
               ...turnInput.message,
               text: context === "" ? userText : `${context}\n\nUser message:\n${userText}`,

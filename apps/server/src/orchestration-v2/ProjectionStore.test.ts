@@ -1811,6 +1811,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
           nextGeneration: 2,
           delivery: null,
         },
+        retainedDispatchOfRunId: RunId.make("run:original-retained-dispatch"),
       };
       const task = {
         id: taskId,
@@ -1868,7 +1869,11 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         payload: task,
       });
 
-      const { delegatedCompletion: _delegatedCompletion, ...staleRun } = run;
+      const {
+        delegatedCompletion: _delegatedCompletion,
+        retainedDispatchOfRunId: _retained,
+        ...staleRun
+      } = run;
       const { completionDelivery: _completionDelivery, ...staleTask } = task;
       yield* projectionStore.apply({
         id: EventId.make("event:projection-delegated-completion:stale-run"),
@@ -1899,6 +1904,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
 
       const projection = yield* projectionStore.getThreadProjection(threadId);
       assert.deepEqual(projection.runs[0]?.delegatedCompletion, run.delegatedCompletion);
+      assert.equal(projection.runs[0]?.retainedDispatchOfRunId, run.retainedDispatchOfRunId);
       assert.deepEqual(projection.subagents[0]?.completionDelivery, task.completionDelivery);
     }),
   );

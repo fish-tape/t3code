@@ -78,6 +78,7 @@ import {
 } from "./CheckpointRestoreSafety.ts";
 import { CheckpointServiceV2 } from "./CheckpointService.ts";
 import { CommandPolicyV2, resolveMessageDispatchIntent } from "./CommandPolicy.ts";
+import { retainedDispatchRecoveryRun } from "./RetainedDispatchRecovery.ts";
 import { CommandReceiptStoreV2 } from "./CommandReceiptStore.ts";
 import { ContextHandoffServiceV2 } from "./ContextHandoffService.ts";
 import { notificationTurnItem } from "./Notification.ts";
@@ -4508,18 +4509,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
       if (command.restartContinuationOfRunId !== undefined) {
         const source = projection.runs.find((run) => run.id === command.restartContinuationOfRunId);
+        // An explicitly requested durable attach can reconcile a failed run or
+        // a result whose hold could not be settled. Automatic restart messages
+        // keep their existing Stop/settled-work exclusions.
+        const retainedRecovery =
+          command.creationSource !== "server" &&
+          command.dispatchMode.type === "start_immediately" &&
+          command.attachments.length === 0 &&
+          retainedDispatchRecoveryRun(projection, command.restartContinuationOfRunId) !== undefined;
         if (
           !source ||
-          source.status !== "cancelled" ||
-          isRestartNoteSource(source, projection.providerTurns) ||
+          (!retainedRecovery && source.status !== "cancelled") ||
+          (!retainedRecovery && isRestartNoteSource(source, projection.providerTurns)) ||
           projection.thread.archivedAt !== null ||
           projection.thread.deletedAt !== null ||
           projection.thread.providerInstanceId !== source.providerInstanceId ||
           // Held queued runs never started; they wait behind the continuation.
-          projection.runs.some(
-            (run) => run.id !== source.id && run.status !== "queued" && runRanAfter(run, source),
-          ) ||
-          (yield* stopReachedRun(command, command.threadId, source.id))
+          (!retainedRecovery &&
+            projection.runs.some(
+              (run) => run.id !== source.id && run.status !== "queued" && runRanAfter(run, source),
+            )) ||
+          (!retainedRecovery && (yield* stopReachedRun(command, command.threadId, source.id)))
         ) {
           // Preserve the current row so stale automatic deliveries receive an
           // accepted receipt without changing work or repeatedly retrying.

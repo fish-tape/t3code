@@ -199,6 +199,9 @@ import {
 } from "./relayClient.ts";
 import {
   ORCHESTRATION_V2_WS_METHODS,
+  PrepareProviderSessionInput,
+  PrepareProviderSessionError,
+  ProviderSessionPreparationReceipt,
   OrchestrationGetWorkflowScriptError,
   OrchestrationV2DispatchCommandError,
   OrchestrationV2GetShellSnapshotError,
@@ -1544,6 +1547,12 @@ const WsSubscribeDeviceStateRpc = Rpc.make(WS_METHODS.subscribeDeviceState, {
   stream: true,
 });
 
+const WsPrepareProviderSessionRpc = Rpc.make(ORCHESTRATION_V2_WS_METHODS.prepareProviderSession, {
+  payload: PrepareProviderSessionInput,
+  success: ProviderSessionPreparationReceipt,
+  error: Schema.Union([PrepareProviderSessionError, EnvironmentAuthorizationError]),
+});
+
 const WsOrchestrationV2DispatchCommandRpc = Rpc.make(ORCHESTRATION_V2_WS_METHODS.dispatchCommand, {
   payload: OrchestrationV2RpcSchemas.dispatchCommand.input,
   success: OrchestrationV2RpcSchemas.dispatchCommand.output,
@@ -1781,6 +1790,7 @@ export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthori
 ) {}
 
 export const WsRpcGroup = RpcGroup.make(
+  WsPrepareProviderSessionRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,

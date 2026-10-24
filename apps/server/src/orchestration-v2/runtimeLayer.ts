@@ -132,6 +132,8 @@ const layerProviderSessionManagerProvided = ProviderSessionManager.layer.pipe(
       IdAllocator.layer,
       layerProviderEventIngestorProvided,
       ProjectionStore.layer,
+      layerRuntimePolicyProvided,
+      ThreadCommandExecutor.layer,
     ),
   ),
 );

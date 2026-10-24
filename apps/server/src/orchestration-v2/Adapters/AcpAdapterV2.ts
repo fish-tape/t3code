@@ -91,8 +91,22 @@ import {
   resolveEmbeddedTerminalContent,
   type AcpClientTerminals,
 } from "../../provider/acp/AcpClientTerminals.ts";
+import {
+  ACP_DURABLE_PROMPT,
+  acpDurableDelivery,
+  acpDurableTurn,
+  supportsAcpDurablePrompt,
+  acpDurableSessionUnavailable,
+} from "./AcpDurablePrompt.ts";
 import { ACP_SESSION_MODE_OPTION_ID } from "../../provider/acp/AcpSessionConfig.ts";
 import * as AcpSessionRuntime from "../../provider/acp/AcpSessionRuntime.ts";
+import {
+  ACP_SESSION_PREPARATION,
+  decodeSessionPreparation,
+  supportsSessionPreparation,
+  sessionPreparationRejected,
+  retainedDispatchRejected,
+} from "../../provider/acp/AcpSessionPreparation.ts";
 import {
   t3AcpPromptWithInstructions,
   type T3AcpInstructionState,
@@ -130,6 +144,9 @@ export const ACP_PROTOCOL = "acp.ndjson-jsonrpc" as const;
 const ACP_DEFERRED_FINALIZE_DEBOUNCE: Duration.Input = "3000 millis";
 
 export interface AcpAdapterV2RuntimeInput {
+  readonly sessionPreparation?: NonNullable<
+    AcpSessionRuntime.AcpSessionRuntimeOptions["sessionPreparation"]
+  >;
   readonly cwd: string;
   /**
    * Policy the session opened with. A runtime-mode change reopens the session,
@@ -1470,12 +1487,18 @@ export function makeAcpAdapterV2(
     flavor.enablePostSettleContinuation === true && continuationRequests !== undefined;
 
   return ProviderAdapter.ProviderAdapterV2.of({
+    supportsSessionPreparation: true,
     instanceId: options.instanceId,
     driver,
     getCapabilities: () => Effect.succeed(flavor.capabilities),
     planSelectionTransition: (input) => Effect.succeed(acpSelectionTransition(input)),
     openSession: Effect.fn("AcpAdapterV2.openSession")(
       function* (input: ProviderAdapter.ProviderAdapterV2OpenSessionInput) {
+        if (input.retainedNativeThreadRequired && input.initialNativeThreadId === undefined)
+          return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            driver,
+            detail: "Retained dispatch reattachment requires its existing native session",
+          });
         const sessionScope = yield* Effect.scope;
         // Persisted ACP threads from before item identity v2 retain their old
         // deterministic ids. Fresh threads scope native ids by instance so
@@ -2053,8 +2076,11 @@ export function makeAcpAdapterV2(
             }
           });
 
+        // Rehydrate the accumulated text/tool state from the journal, but publish
+        // only frames after the checkpoint T3 has already committed.
+        let suppressDurableReplay = false;
         const emitProviderEvent = (event: ProviderAdapter.ProviderAdapterV2Event) =>
-          Queue.offer(events, event).pipe(Effect.asVoid);
+          suppressDurableReplay ? Effect.void : Queue.offer(events, event).pipe(Effect.asVoid);
         let scheduleDeferredFinalize: (context: ActiveAcpTurn) => Effect.Effect<void> = () =>
           Effect.void;
 
@@ -2073,6 +2099,11 @@ export function makeAcpAdapterV2(
         ): AcpAdapterV2RuntimeInput => {
           const mcpContext = acpMcpContext(threadId, self);
           return {
+            ...(!preparedRetainedSession || input.preparationRequestId === undefined
+              ? {}
+              : {
+                  sessionPreparation: { requestId: input.preparationRequestId },
+                }),
             cwd: input.runtimePolicy.cwd ?? process.cwd(),
             runtimePolicy: input.runtimePolicy,
             mcpServers: mcpContext.servers,
@@ -2089,7 +2120,7 @@ export function makeAcpAdapterV2(
               },
               terminal: clientTerminals !== undefined,
               elicitation: { form: {}, ...(flavor.onUrlElicitation ? { url: {} } : {}) },
-              ...(flavor.clientCapabilitiesMeta ? { _meta: flavor.clientCapabilitiesMeta } : {}),
+              _meta: { ...flavor.clientCapabilitiesMeta, [ACP_DURABLE_PROMPT]: true },
             },
             clientInfo: { name: "t3-code", version: "0.0.0" },
             onTermination,
@@ -5452,9 +5483,58 @@ export function makeAcpAdapterV2(
                 ) ?? Effect.void
               );
             }
+            const delivery = acpDurableDelivery(rawNotification._meta);
+            const context = yield* Ref.get(activeTurn);
+            const durable =
+              context?.nativeThreadId === notification.sessionId
+                ? context.nativeMetadata?.acpDurablePrompt
+                : undefined;
+            // Ignore stale traffic from a different durable turn. It cannot be
+            // interpreted as output from the current prompt.
+            if (delivery !== undefined && durable?.turnId !== delivery.turnId) return;
+            suppressDurableReplay =
+              delivery !== undefined &&
+              durable !== undefined &&
+              delivery.sequence <= durable.sequence;
             yield* handleSessionUpdate(
               flavor.normalizeSessionUpdate?.(notification) ?? notification,
+            ).pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  suppressDurableReplay = false;
+                }),
+              ),
             );
+            if (
+              delivery === undefined ||
+              durable === undefined ||
+              context === null ||
+              delivery.sequence <= durable.sequence
+            )
+              return;
+            context.nativeMetadata = {
+              ...context.nativeMetadata,
+              acpDurablePrompt: { ...durable, sequence: delivery.sequence },
+            };
+            yield* Ref.update(nativeMetadataBySessionId, (current) =>
+              new Map(current).set(notification.sessionId, context.nativeMetadata!),
+            );
+            const known = (yield* Ref.get(providerThreadByNativeSessionId)).get(
+              notification.sessionId,
+            );
+            if (known !== undefined) {
+              const providerThread = {
+                ...known,
+                nativeMetadata: context.nativeMetadata,
+                updatedAt: yield* DateTime.now,
+              };
+              yield* Ref.update(providerThreadByNativeSessionId, (current) =>
+                new Map(current).set(notification.sessionId, providerThread),
+              );
+              // Queue the checkpoint AFTER every output event from this frame.
+              // A crash before it commits simply replays the same item snapshots.
+              yield* emitProviderEvent({ type: "provider_thread.updated", driver, providerThread });
+            }
           }).pipe(
             Effect.mapError(
               (cause) =>
@@ -5959,10 +6039,29 @@ export function makeAcpAdapterV2(
           return mcpBridge;
         });
 
+        let preparedRetainedSession = input.preparationRequestId !== undefined;
+        let retainedDispatchAttachment = input.retainedNativeThreadRequired === true;
+        // A rejected/uncertain turn still owns preserved native state even
+        // when its preparation reservation is reusable. Only durable completed
+        // settlement permits ordinary native teardown or replacement again.
+        let retainedSessionHold = preparedRetainedSession || retainedDispatchAttachment;
+        let preparedBinding:
+          | { requestId: string; sessionId: string; generation: string; consumed: boolean }
+          | undefined;
+
         const spawnAcpRuntime = Effect.fnUntraced(function* (
           threadId: ThreadId | null,
           resumeSessionId?: string,
         ) {
+          if (
+            (preparedRetainedSession || retainedDispatchAttachment || retainedSessionHold) &&
+            runtimeScope !== undefined
+          ) {
+            return yield* new EffectAcpErrors.AcpTransportError({
+              cause: "preparation_invalidated",
+              detail: "Prepared attachment changed; a new preparation is required",
+            });
+          }
           if (runtimeScope !== undefined) {
             yield* Scope.close(runtimeScope, Exit.void);
           }
@@ -6000,6 +6099,11 @@ export function makeAcpAdapterV2(
             replacement: AcpSessionRuntime.AcpSessionRuntimeStartResult,
           ) => Effect.Effect<void>,
         ) {
+          if (preparedRetainedSession || retainedDispatchAttachment || retainedSessionHold)
+            return yield* new EffectAcpErrors.AcpTransportError({
+              cause: "preparation_invalidated",
+              detail: "Prepared attachment cannot be replaced",
+            });
           const previousScope = runtimeScope;
           const previousGeneration = yield* Ref.get(runtimeCallbackGeneration);
           yield* runtimeCallbackPermit.withPermit(awaitAdmittedNativeResponses);
@@ -6167,7 +6271,10 @@ export function makeAcpAdapterV2(
               const failedMethod =
                 "method" in initialStart.failure ? initialStart.failure.method : undefined;
               if (
+                input.preparationRequestId !== undefined ||
+                input.retainedNativeThreadRequired === true ||
                 input.initialNativeThreadId === undefined ||
+                acpDurableSessionUnavailable(initialStart.failure) ||
                 (failedMethod !== "session/load" && failedMethod !== "session/resume")
               ) {
                 return yield* initialStart.failure;
@@ -6185,6 +6292,12 @@ export function makeAcpAdapterV2(
         yield* Ref.set(activeSessionSetup, started);
         rememberTerminalEnvironment(started.sessionId, input.threadId);
         const capabilities = negotiatedCapabilities(flavor.capabilities, started);
+        const durablePrompts = supportsAcpDurablePrompt(started.initializeResult._meta);
+        if (input.retainedNativeThreadRequired && !durablePrompts)
+          return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            driver,
+            detail: "Retained dispatch reattachment requires durable prompt support",
+          });
         const canLoadSession = started.initializeResult.agentCapabilities?.loadSession === true;
         const canResumeSession =
           started.initializeResult.agentCapabilities?.sessionCapabilities?.resume != null;
@@ -6198,6 +6311,11 @@ export function makeAcpAdapterV2(
           sessionId: string,
           threadId: ThreadId | null,
         ) {
+          if (preparedRetainedSession)
+            return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+              driver,
+              detail: "Prepared attachment requires a new preparation before loading",
+            });
           const initialFailure = yield* Ref.modify(initialSessionActivationFailure, (failure) =>
             failure?.sessionId === sessionId ? [failure.error, null] : [undefined, failure],
           );
@@ -6421,9 +6539,11 @@ export function makeAcpAdapterV2(
           );
         });
 
-        yield* configureSession(started, input.modelSelection, input.runtimePolicy);
-        yield* Ref.set(activeSelection, input.modelSelection);
-        yield* Ref.set(activeInteractionMode, input.runtimePolicy.interactionMode);
+        if (!durablePrompts || input.initialNativeThreadId === undefined) {
+          yield* configureSession(started, input.modelSelection, input.runtimePolicy);
+          yield* Ref.set(activeSelection, input.modelSelection);
+          yield* Ref.set(activeInteractionMode, input.runtimePolicy.interactionMode);
+        }
         const createdAt = yield* DateTime.now;
         const providerSession: OrchestrationV2ProviderSession = {
           id: input.providerSessionId,
@@ -6818,6 +6938,33 @@ export function makeAcpAdapterV2(
 
         const startTurnUnlocked = Effect.fn("AcpAdapterV2.startTurn")(
           function* (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) {
+            const marker = turnInput.appThread.sessionPreparation;
+            const retainedAttach =
+              marker?.dispatchingRunId !== undefined &&
+              marker.dispatchingRunId === turnInput.restartContinuationOfRunId &&
+              marker.providerThreadId === turnInput.providerThread.id &&
+              marker.providerSessionId === input.providerSessionId &&
+              marker.nativeId === turnInput.providerThread.nativeThreadRef?.nativeId;
+            if ((retainedAttach || turnInput.preparationLifecycle !== undefined) && !durablePrompts)
+              return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                driver,
+                detail: "Retained dispatch requires durable prompt support",
+              });
+            if (preparedRetainedSession && !retainedAttach) {
+              const receipt = turnInput.appThread.sessionPreparation?.receipt;
+              if (
+                preparedBinding === undefined ||
+                receipt === undefined ||
+                receipt.requestId !== preparedBinding.requestId ||
+                receipt.nativeSession.sessionId !== preparedBinding.sessionId ||
+                receipt.nativeSession.generation !== preparedBinding.generation
+              ) {
+                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver,
+                  detail: "Prepared attachment is stale",
+                });
+              }
+            }
             yield* awaitRuntimeTeardown();
             const existing = yield* Ref.get(activeTurn);
             if (existing !== null) {
@@ -6825,6 +6972,10 @@ export function makeAcpAdapterV2(
                 driver,
                 detail: `ACP provider turn ${existing.providerTurnId} is still active`,
               });
+            }
+            if (retainedAttach) {
+              retainedDispatchAttachment = true;
+              retainedSessionHold = true;
             }
             useProviderThreadIdentity(turnInput.providerThread);
             // Session activation can itself invoke client fs/terminal methods.
@@ -6835,16 +6986,24 @@ export function makeAcpAdapterV2(
             const restartAfterInterrupt = yield* restartRuntimeAfterTeardownIfRequired(
               turnInput.threadId,
             );
+            const durableAttach =
+              durablePrompts && turnInput.restartContinuationOfRunId !== undefined;
             const needsSessionActivation =
               (yield* Ref.get(activeSessionId)) !== requestedSessionId || restartAfterInterrupt;
             if (needsSessionActivation) {
               const activated = yield* activateSession(requestedSessionId, turnInput.threadId);
               yield* Ref.set(activeSessionId, activated.sessionId);
               yield* Ref.set(activeSessionSetup, activated);
-              yield* configureSession(activated, turnInput.modelSelection, turnInput.runtimePolicy);
-              yield* Ref.set(activeSelection, turnInput.modelSelection);
-              yield* Ref.set(activeInteractionMode, turnInput.runtimePolicy.interactionMode);
-            } else {
+              if (!durableAttach) {
+                yield* configureSession(
+                  activated,
+                  turnInput.modelSelection,
+                  turnInput.runtimePolicy,
+                );
+                yield* Ref.set(activeSelection, turnInput.modelSelection);
+                yield* Ref.set(activeInteractionMode, turnInput.runtimePolicy.interactionMode);
+              }
+            } else if (!durableAttach) {
               const configuredSelection = yield* Ref.get(activeSelection);
               const configuredInteractionMode = yield* Ref.get(activeInteractionMode);
               if (
@@ -6917,7 +7076,19 @@ export function makeAcpAdapterV2(
               ? null
               : yield* resolvePromptParts(turnInput, requestedSessionId);
             const startedAt = yield* DateTime.now;
-            const nativeTurnId = `${requestedSessionId}:turn:${turnInput.providerTurnOrdinal}`;
+            const durableTurn = durablePrompts
+              ? acpDurableTurn({
+                  sessionId: requestedSessionId,
+                  runId: turnInput.runId,
+                  ...(turnInput.restartContinuationOfRunId === undefined
+                    ? {}
+                    : { restartContinuationOfRunId: turnInput.restartContinuationOfRunId }),
+                  metadata: turnInput.providerThread.nativeMetadata,
+                })
+              : undefined;
+            const nativeTurnId =
+              durableTurn?.nativeTurnId ??
+              `${requestedSessionId}:turn:${turnInput.providerTurnOrdinal}`;
             const providerTurnId = deriveProviderTurnId(nativeTurnId);
             const completed = yield* Deferred.make<void, never>();
             const promptWireSettled = yield* Deferred.make<void, never>();
@@ -6927,12 +7098,24 @@ export function makeAcpAdapterV2(
             const rememberedNativeMetadata = (yield* Ref.get(nativeMetadataBySessionId)).get(
               requestedSessionId,
             );
-            const initialNativeMetadata =
+            const priorNativeMetadata =
               rememberedNativeMetadata === undefined
                 ? (turnInput.providerThread.nativeMetadata ?? null)
                 : {
                     ...turnInput.providerThread.nativeMetadata,
                     ...rememberedNativeMetadata,
+                  };
+            const initialNativeMetadata =
+              durableTurn === undefined
+                ? priorNativeMetadata
+                : {
+                    ...priorNativeMetadata,
+                    acpDurablePrompt: {
+                      turnId: durableTurn.turnId,
+                      nativeTurnId: durableTurn.nativeTurnId,
+                      sequence: durableTurn.sequence,
+                      runId: turnInput.runId,
+                    },
                   };
             if (initialNativeMetadata !== null) {
               yield* Ref.update(nativeMetadataBySessionId, (current) =>
@@ -7099,7 +7282,79 @@ export function makeAcpAdapterV2(
               return;
             }
             const promptGeneration = yield* Ref.get(runtimeCallbackGeneration);
-            yield* runtime.prompt({ prompt: promptParts!.prompt }).pipe(
+            const prepared =
+              preparedBinding?.consumed === false
+                ? turnInput.appThread.sessionPreparation?.receipt
+                : undefined;
+            const promptPayload = {
+              prompt: promptParts!.prompt,
+              ...(durableTurn === undefined && prepared === undefined
+                ? {}
+                : {
+                    _meta: {
+                      ...(prepared === undefined
+                        ? {}
+                        : {
+                            [ACP_SESSION_PREPARATION]: {
+                              requestId: prepared.requestId,
+                              expectedGeneration: prepared.nativeSession.generation,
+                            },
+                          }),
+                      ...(durableTurn === undefined
+                        ? {}
+                        : {
+                            [ACP_DURABLE_PROMPT]: {
+                              turnId: durableTurn.turnId,
+                              ...(durableTurn.attach ? { attach: true } : {}),
+                              ...(retainedAttach && marker?.receipt !== undefined
+                                ? {
+                                    reconcilePreparation: {
+                                      requestId: marker.requestId,
+                                      expectedGeneration: marker.receipt.nativeSession.generation,
+                                    },
+                                  }
+                                : {}),
+                            },
+                          }),
+                    },
+                  }),
+            };
+            yield* turnInput.preparationLifecycle?.beforePrompt() ?? Effect.void;
+            if (prepared !== undefined && preparedBinding !== undefined) {
+              // End the inspection window at genuine turn admission. The captured
+              // payload still checks request/generation atomically at the controller.
+              preparedBinding.consumed = true;
+              preparedRetainedSession = false;
+            }
+            const settlePreparation = (outcome: "completed" | "rejected") =>
+              (turnInput.preparationLifecycle?.result(outcome) ?? Effect.void).pipe(
+                Effect.as(true),
+                // Persistence failure keeps the durable hold. It must never
+                // replace a native result or skip terminal event delivery.
+                Effect.catchCause(() =>
+                  Effect.logWarning("orchestration-v2.preparation-settlement-failed", {
+                    driver,
+                    threadId: turnInput.threadId,
+                    runId: turnInput.runId,
+                    outcome,
+                  }).pipe(Effect.as(false)),
+                ),
+              );
+            yield* runtime.prompt(promptPayload).pipe(
+              Effect.tap(() =>
+                Deferred.succeed(context.promptWireSettled, undefined).pipe(Effect.asVoid),
+              ),
+              Effect.tap(() => {
+                retainedDispatchAttachment = false;
+                preparedRetainedSession = false;
+                return settlePreparation("completed").pipe(
+                  Effect.tap((settled) =>
+                    Effect.sync(() => {
+                      if (settled) retainedSessionHold = false;
+                    }),
+                  ),
+                );
+              }),
               Effect.tap(() =>
                 Ref.update(promptInstructionStates, (current) => {
                   if (promptParts?.instructionState === undefined) return current;
@@ -7107,12 +7362,6 @@ export function makeAcpAdapterV2(
                   updated.set(requestedSessionId, promptParts.instructionState);
                   return updated;
                 }),
-              ),
-              // Wire settlement precedes the completion callback's permit request so
-              // settled-soft classification can observe the native return even when
-              // the completion fiber has not yet set promptSettled under the permit.
-              Effect.tap(() =>
-                Deferred.succeed(context.promptWireSettled, undefined).pipe(Effect.asVoid),
               ),
               Effect.flatMap((result) =>
                 runRuntimeCallbackAtGeneration(
@@ -7153,6 +7402,22 @@ export function makeAcpAdapterV2(
                 runRuntimeCallbackAtGeneration(
                   promptGeneration,
                   Effect.gen(function* () {
+                    // An uncertain prompt cannot reuse preparation for another attempt.
+                    const rejected =
+                      (prepared !== undefined &&
+                        !retainedAttach &&
+                        sessionPreparationRejected(Cause.squash(cause))) ||
+                      (durableTurn !== undefined &&
+                        retainedDispatchRejected(Cause.squash(cause), durableTurn.turnId));
+                    if (rejected) {
+                      yield* settlePreparation("rejected");
+                      preparedBinding = undefined;
+                      preparedRetainedSession = false;
+                      retainedDispatchAttachment = false;
+                    } else if (prepared !== undefined) {
+                      preparedBinding = undefined;
+                      preparedRetainedSession = true;
+                    }
                     if (context.finalized) return;
                     yield* finalizeTurn(
                       context,
@@ -7209,14 +7474,16 @@ export function makeAcpAdapterV2(
               }),
             );
             const requests = [...(yield* Ref.get(pendingRuntimeRequests)).values()];
-            yield* Effect.forEach(
-              requests,
-              (request) =>
-                request.type === "approval"
-                  ? Deferred.succeed(request.decision, "cancel").pipe(Effect.ignore)
-                  : Deferred.succeed(request.answers, null).pipe(Effect.ignore),
-              { discard: true },
-            );
+            if (!preparedRetainedSession && !retainedDispatchAttachment && !retainedSessionHold) {
+              yield* Effect.forEach(
+                requests,
+                (request) =>
+                  request.type === "approval"
+                    ? Deferred.succeed(request.decision, "cancel").pipe(Effect.ignore)
+                    : Deferred.succeed(request.answers, null).pipe(Effect.ignore),
+                { discard: true },
+              );
+            }
             const closingError = new EffectAcpErrors.AcpTransportError({
               detail: "The ACP session closed before its admitted response reached the transport",
               cause: "ACP session transport closed",
@@ -7230,7 +7497,13 @@ export function makeAcpAdapterV2(
             yield* options.testHooks?.afterNativeResponseTransportClosed?.() ?? Effect.void;
             const sessionCapabilities =
               started.initializeResult.agentCapabilities?.sessionCapabilities;
-            if (sessionCapabilities?.close != null) {
+            // Release the local transport, retaining native work and pending permissions.
+            if (
+              !preparedRetainedSession &&
+              !retainedDispatchAttachment &&
+              !retainedSessionHold &&
+              sessionCapabilities?.close != null
+            ) {
               yield* runtimeTransitionPermit.withPermitsIfAvailable(1)(
                 Effect.gen(function* () {
                   const teardownState = yield* Ref.get(runtimeTeardownState);
@@ -7328,6 +7601,70 @@ export function makeAcpAdapterV2(
                 ),
               ),
           ),
+          prepareThread: (preparation) =>
+            runtimeTransitionPermit.withPermit(
+              Effect.gen(function* () {
+                if ((yield* Ref.get(activeTurn)) !== null)
+                  return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver,
+                    detail: "Preparation requires an idle attachment",
+                  });
+                if (!supportsSessionPreparation(started.initializeResult._meta)) {
+                  return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver,
+                    detail: "Existing-session preparation is not supported",
+                  });
+                }
+                const sessionId = yield* nativeThreadId(driver, preparation.providerThread);
+                // Strict eager activation already applied this request. Retrying it is read-only.
+                const activated =
+                  input.preparationRequestId === preparation.requestId
+                    ? started
+                    : yield* runtime.loadSession(sessionId, {
+                        ...acpMcpActivation(preparation.providerThread.appThreadId, self),
+                        sessionPreparation: {
+                          requestId: preparation.requestId,
+                          ...(preparation.expectedGeneration === undefined
+                            ? {}
+                            : {
+                                expectedGeneration: preparation.expectedGeneration,
+                              }),
+                        },
+                      });
+                const decoded = decodeSessionPreparation(activated.sessionSetupResult._meta);
+                if (
+                  Option.isNone(decoded) ||
+                  decoded.value[ACP_SESSION_PREPARATION].sessionId !== sessionId ||
+                  (preparation.expectedGeneration !== undefined &&
+                    decoded.value[ACP_SESSION_PREPARATION].generation !==
+                      preparation.expectedGeneration)
+                ) {
+                  return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver,
+                    detail: "Existing-session preparation receipt is missing or stale",
+                  });
+                }
+                preparedRetainedSession = true;
+                retainedSessionHold = true;
+                preparedBinding = {
+                  requestId: preparation.requestId,
+                  ...decoded.value[ACP_SESSION_PREPARATION],
+                  consumed: false,
+                };
+                yield* Ref.set(activeSessionId, sessionId);
+                yield* Ref.set(activeSessionSetup, activated);
+                return decoded.value[ACP_SESSION_PREPARATION];
+              }).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapter.ProviderAdapterProtocolError({
+                      driver,
+                      detail: "Existing-session preparation failed",
+                      cause,
+                    }),
+                ),
+              ),
+            ),
           resumeThread: Effect.fn("AcpAdapterV2.resumeThread")(
             function* (threadInput: {
               readonly providerThread: OrchestrationV2ProviderThread;
@@ -7362,9 +7699,11 @@ export function makeAcpAdapterV2(
                     yield* Ref.set(activeSessionSetup, activated);
                     const nextSelection = threadInput.modelSelection ?? input.modelSelection;
                     const nextRuntimePolicy = threadInput.runtimePolicy ?? input.runtimePolicy;
-                    yield* configureSession(activated, nextSelection, nextRuntimePolicy);
-                    yield* Ref.set(activeSelection, nextSelection);
-                    yield* Ref.set(activeInteractionMode, nextRuntimePolicy.interactionMode);
+                    if (!durablePrompts) {
+                      yield* configureSession(activated, nextSelection, nextRuntimePolicy);
+                      yield* Ref.set(activeSelection, nextSelection);
+                      yield* Ref.set(activeInteractionMode, nextRuntimePolicy.interactionMode);
+                    }
                   }
                   const now = yield* DateTime.now;
                   return {
@@ -7670,6 +8009,9 @@ export function makeAcpAdapterV2(
                           detail: `ACP provider turn ${turnInput.providerTurnId} did not acknowledge cancellation before the interrupt timeout`,
                         });
                       }
+                      // Local finalization (including transport loss after cancel)
+                      // does not prove the remote operation stopped. Only the
+                      // native prompt's successful return settles its durable hold.
                     });
                     if (!hardRestart) {
                       return yield* restore(runTransition);

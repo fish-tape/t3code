@@ -78,6 +78,95 @@ run before the prompt. They reject profiles with such configuration before launc
 instructions and tool denial do not create a native sandbox.
 See [helper constraints](../../apps/server/src/textGeneration/AntigravityTextGeneration.ts).
 
+## Prepare a retained stopped session without a prompt
+
+The authenticated `orchestration.prepareProviderSession` RPC requires
+`environment:maintain`. Supply a fresh `requestId`, the app `threadId`, its expected
+`providerThreadId`, `providerSessionId`, logical `nativeId`, and latest
+`completedRunId`. The manager verifies idle ownership under the normal thread lock,
+uses the current registry/toolkit policy, and strictly loads that existing session.
+It creates no message or run and never falls back to a new native session.
+
+The ACP controller must advertise root `_meta["t3code.sessionPreparation"] = 1`.
+Strict load carries `{ requestId, expectedGeneration? }` in that metadata key;
+ACP v2 represents the compatibility load as `session/resume`. A real response must
+acknowledge the same logical session, an opaque generation string, applied toolkit,
+idle state and zero pending permissions. A replay idle gap is insufficient.
+The public receipt adds the expected binding and a process-local attachment identity;
+it excludes toolkit configuration and credentials.
+
+Preparation reserves the attachment for inspection without keeping it alive through
+synthetic prompts. The reservation ends when a genuine turn is accepted or the
+operator uses normal detach/release. That next turn carries the same request and
+expected generation. Both T3 and the controller reject a stale marker before native
+dispatch. After local validation, T3 records dispatch intent immediately before the
+native RPC. A restart may reattach only to that original operation until a native
+result (including native cancellation) retires its hold. Local Stop finalization
+does not prove remote cancellation. Uncertain delivery survives transport
+release and process restart; it cannot open an ordinary turn or a fresh native
+fallback. Pre-dispatch failure leaves preparation unused. A controller-certified
+rejection clears only dispatch intent and its stale receipt, allowing a fresh
+preparation request. Numeric error codes alone do not prove rejection.
+
+For an uncertain dispatch or a result whose settlement could not persist, an
+authorized operator can explicitly reattach through the existing authenticated
+`orchestration.dispatchCommand` RPC: submit `message.dispatch` with a stable new
+`commandId`/`messageId`, the same `threadId`, `creationSource: "mcp"`, no attachments,
+`dispatchMode: { type: "start_immediately" }`, and
+`restartContinuationOfRunId` equal to the persisted `sessionPreparation.dispatchingRunId`.
+The text labels the recovery in the app; durable ACP sends an attach for the
+original operation, never that text as a new native prompt. This also handles a
+failed app run and a crash before the provider's running event committed. Exact
+current strong binding, no pending requests or competing work are required.
+Later messages rejected by this hold do not hide its original operation. If the
+controller has no recorded turn, attach includes the original preparation request
+and generation for authenticated absence reconciliation. Only a same-generation,
+idle controller with no competing preparation or pending requests may durably
+fence that exact turn ID, then certify `{kind:"retained_dispatch", dispatch:"rejected", turnId}`.
+The fence prevents a delayed original request from ever starting. T3 matches the
+exact root turn ID before clearing dispatch intent, then requires fresh preparation
+and a new genuine turn ID. Retrying reconciliation retrieves the same proof if
+central settlement failed; there need not be a retained completion. A journaled
+turn, changed generation before fencing, unavailable controller or missing proof remains held.
+Once persisted, the fence's original request and generation can prove rejection
+even when the worker later parks, becomes unreachable or changes generation.
+That historical proof grants no current toolkit/binding readiness.
+An older controller without reconciliation support fails held. There is no blind
+replay or database edit procedure. A stopped run is reattached only by this explicit command;
+automatic restart deliveries keep their Stop exclusions.
+
+If the owned local ACP bridge exited, first inspect the complete current history
+and confirm all app/provider turns are terminal, no queued work or pending requests
+exist, and the provider session still belongs to this thread. An explicitly
+authorized `provider-session.detach` command through `orchestration.dispatchCommand`
+can release that local attachment before the attach-only recovery above. For the
+retained-dispatch runtime, cleanup is transport-only; it sends no native close,
+cancel, permission response or lifecycle recovery. The dispatch hold persists.
+Do not use this procedure on active or uncertain live-owner work, or treat a
+successful local detach as controller completion. A cold attach still requires
+the exact retained binding and never substitutes a new session. Attach-only runs
+also do not count as delivery of a restart's lost-background-work note; the next
+ordinary prompt still owes that note.
+
+After settlement, later turns and ordinary cleanup do not reuse the consumed
+marker. Before dispatch, detach, release, restart or any attachment/binding change
+invalidates readiness and requires fresh preparation. An initial failed preparation
+does not hold an ordinary thread; a failed refresh preserves an established hold.
+Certified rejection leaves that retained hold intact: cleanup releases only the
+local transport and runtime replacement remains refused, while fresh preparation
+may reuse the existing transport. Ordinary native close becomes eligible only
+after native completion and successful durable completed settlement. A failed
+settlement cannot make cleanup destroy retained work.
+Retrying a current request returns its receipt without reapplying the toolkit;
+an expired request cannot be replayed into a new attachment.
+
+A parked, absent, destroyed or uncertain worker stays held. Export, migrate and
+restore retained files/native history through a separately authorized lifecycle;
+verify the intended binding and installed tools, then prepare with a new request.
+Preparation does not restore a workspace, recover a worker, upgrade tools, answer
+permissions or authorize a continuation. Controller implementations must preserve
+this strict boundary when adding park/restore behavior.
+
 ## Provider updates run only through the owning installer
 
 A package manager runs only when the resolved executable's path proves it owns the install. Homebrew

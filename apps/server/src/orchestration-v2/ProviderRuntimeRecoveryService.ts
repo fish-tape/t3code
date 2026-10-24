@@ -648,10 +648,15 @@ export const make = Effect.gen(function* () {
           },
         });
       }
-      const continuationRun =
-        continueAfterRestart && trigger === "startup"
-          ? restartContinuationRun(projection)
-          : undefined;
+      const candidate = trigger === "startup" ? restartContinuationRun(projection) : undefined;
+      const durable =
+        candidate !== undefined &&
+        projection.providerThreads.some(
+          (thread) =>
+            thread.id === candidate.providerThreadId &&
+            thread.nativeMetadata?.acpDurablePrompt !== undefined,
+        );
+      const continuationRun = continueAfterRestart || durable ? candidate : undefined;
       const effects: Array<EffectOutbox.PendingOrchestrationEffectV2> = continuationRun
         ? [
             {
@@ -781,13 +786,19 @@ export const make = Effect.gen(function* () {
     for (const threadId of threadIds) {
       yield* Effect.gen(function* () {
         const projection = yield* projections.getRuntimeRecoveryProjection(threadId);
+        const run = restartContinuationRun(projection);
+        if (!run) return;
+        const durable = projection.providerThreads.some(
+          (thread) =>
+            thread.id === run.providerThreadId &&
+            thread.nativeMetadata?.acpDurablePrompt !== undefined,
+        );
         if (
+          !durable &&
           !resolveProjectSettings(enabled, projection.thread.projectId).settings
             .continueThreadsAfterServerUpdate
         )
           return;
-        const run = restartContinuationRun(projection);
-        if (!run) return;
         const commandId = CommandId.make(`command:restart-prepare:${run.id}`);
         yield* eventSink.writeWithEffects({
           commandId,

@@ -225,6 +225,7 @@ export function pendingRestartCancelledBackgroundWork(input: {
   const prompted = sameThread.filter(
     (candidate) =>
       candidate.id !== input.run.id &&
+      candidate.retainedDispatchOfRunId === undefined &&
       candidate.activeAttemptId !== null &&
       candidate.status !== "rolled_back" &&
       (deliveredAttemptIds.has(candidate.activeAttemptId) ||

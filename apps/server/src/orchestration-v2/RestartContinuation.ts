@@ -96,14 +96,9 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
     const messageId = MessageId.make(`message:restart-continuation:${input.sourceRunId}`);
     const projection = yield* threads.getThreadRecords(
       input.threadId,
-      ["messages", "runs", "providerTurns", "attempts"],
+      ["messages", "runs", "providerTurns", "attempts", "providerThreads"],
       { messageIds: [messageId] },
     );
-    if (
-      !resolveProjectSettings(enabled, projection.thread.projectId).settings
-        .continueThreadsAfterServerUpdate
-    )
-      return;
     if (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null) return;
 
     if (projection.messages.some((message) => message.id === messageId)) return;
@@ -114,6 +109,19 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
       !source ||
       source.status !== "cancelled" ||
       isRestartNoteSource(source, projection.providerTurns)
+    )
+      return;
+    const durable = projection.providerThreads.some(
+      (thread) =>
+        thread.id === source.providerThreadId &&
+        thread.nativeMetadata?.acpDurablePrompt !== undefined,
+    );
+    // A durable attach joins work that is already running; the setting controls
+    // sending a new continuation prompt to providers without this capability.
+    if (
+      !durable &&
+      !resolveProjectSettings(enabled, projection.thread.projectId).settings
+        .continueThreadsAfterServerUpdate
     )
       return;
     // A user submission after reconciliation takes precedence over an automatic

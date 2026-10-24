@@ -28,6 +28,11 @@ import type * as EffectAcpSchema from "effect-acp/compat";
 import type * as EffectAcpProtocol from "effect-acp/protocol";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import {
+  ACP_SESSION_PREPARATION,
+  supportsSessionPreparation,
+  type SessionPreparationRequest,
+} from "./AcpSessionPreparation.ts";
 
 import { signalProcessGroup } from "../../process/processGroup.ts";
 import { appendAcpStderrTail, sanitizeAcpStderrExcerpt } from "./AcpStderr.ts";
@@ -91,6 +96,7 @@ export interface AcpSpawnInput {
 }
 
 export interface AcpSessionRuntimeOptions {
+  readonly sessionPreparation?: SessionPreparationRequest;
   readonly spawn: AcpSpawnInput;
   readonly cwd: string;
   readonly resumeSessionId?: string;
@@ -1120,6 +1126,7 @@ export interface AcpSessionRuntimeStartResult {
 }
 
 export interface AcpSessionActivationOptions {
+  readonly sessionPreparation?: SessionPreparationRequest;
   readonly mcpServers?: ReadonlyArray<EffectAcpSchema.McpServer>;
   readonly acpMcpServers?: ReadonlyArray<EffectAcpSchema.McpServer>;
 }
@@ -2071,9 +2078,11 @@ export const make = (
             const idleFiber = yield* waitForSessionLoadReplayIdle({
               gateRef: sessionLoadGateRef,
             }).pipe(Effect.forkIn(runtimeScope));
-            const loaded = yield* Effect.raceFirst(
-              acp.agent.loadSession(loadPayload),
-              Fiber.join(idleFiber),
+            // A retained-session receipt must come from the controller, never a replay idle gap.
+            const loaded = yield* (
+              loadPayload._meta?.[ACP_SESSION_PREPARATION] === undefined
+                ? Effect.raceFirst(acp.agent.loadSession(loadPayload), Fiber.join(idleFiber))
+                : acp.agent.loadSession(loadPayload)
             ).pipe(
               Effect.ensuring(Fiber.interrupt(idleFiber).pipe(Effect.ignore)),
               Effect.timeoutOption(sessionLoadTimeout),
@@ -2280,13 +2289,34 @@ export const make = (
         const additionalDirectories = options.additionalDirectories?.length
           ? { additionalDirectories: options.additionalDirectories }
           : {};
+        if (options.sessionPreparation !== undefined && !options.resumeSessionId) {
+          return yield* new EffectAcpErrors.AcpTransportError({
+            cause: "existing_session_required",
+            detail: "Preparation requires an existing session",
+          });
+        }
         if (options.resumeSessionId) {
+          if (
+            options.sessionPreparation !== undefined &&
+            (!supportsSessionPreparation(initializeResult._meta) ||
+              initializeResult.agentCapabilities?.loadSession !== true)
+          ) {
+            return yield* new EffectAcpErrors.AcpRequestError({
+              code: -32601,
+              errorMessage: "Existing-session preparation is not supported",
+            });
+          }
           sessionId = options.resumeSessionId;
           if (
             initializeResult.agentCapabilities?.loadSession === true &&
-            options.resumeMethod !== "resume"
+            (options.sessionPreparation !== undefined || options.resumeMethod !== "resume")
           ) {
             const loadPayload = {
+              ...(options.sessionPreparation === undefined
+                ? {}
+                : {
+                    _meta: { [ACP_SESSION_PREPARATION]: options.sessionPreparation },
+                  }),
               sessionId,
               cwd: options.cwd,
               ...additionalDirectories,
@@ -2523,7 +2553,24 @@ export const make = (
       loadSession: (sessionId, activationOptions) =>
         start.pipe(
           Effect.flatMap((started) => {
+            if (
+              activationOptions?.sessionPreparation !== undefined &&
+              (!supportsSessionPreparation(started.initializeResult._meta) ||
+                started.initializeResult.agentCapabilities?.loadSession !== true)
+            ) {
+              return Effect.fail(
+                new EffectAcpErrors.AcpRequestError({
+                  code: -32601,
+                  errorMessage: "Existing-session preparation is not supported",
+                }),
+              );
+            }
             const requestPayload = {
+              ...(activationOptions?.sessionPreparation === undefined
+                ? {}
+                : {
+                    _meta: { [ACP_SESSION_PREPARATION]: activationOptions.sessionPreparation },
+                  }),
               sessionId,
               cwd: options.cwd,
               mcpServers: sessionMcpServers(started.initializeResult, activationOptions),

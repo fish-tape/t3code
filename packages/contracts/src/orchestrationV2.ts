@@ -361,8 +361,69 @@ export const OrchestrationV2LimitRecoveryUpdate = Schema.Struct({
 );
 export type OrchestrationV2LimitRecoveryUpdate = typeof OrchestrationV2LimitRecoveryUpdate.Type;
 
+/** An acknowledged existing native session; deliberately excludes toolkit configuration. */
+export const NativeSessionPreparationReceipt = Schema.Struct({
+  sessionId: TrimmedNonEmptyString,
+  generation: TrimmedNonEmptyString,
+  toolkitApplied: Schema.Literal(true),
+  idle: Schema.Literal(true),
+  pendingPermissions: Schema.Literal(0),
+});
+export type NativeSessionPreparationReceipt = typeof NativeSessionPreparationReceipt.Type;
+
+export const PrepareProviderSessionInput = Schema.Struct({
+  requestId: CommandId,
+  threadId: ThreadId,
+  providerThreadId: ProviderThreadId,
+  providerSessionId: ProviderSessionId,
+  nativeId: TrimmedNonEmptyString,
+  completedRunId: RunId,
+});
+export type PrepareProviderSessionInput = typeof PrepareProviderSessionInput.Type;
+
+export const ProviderSessionPreparationReceipt = Schema.Struct({
+  ...PrepareProviderSessionInput.fields,
+  attachmentId: TrimmedNonEmptyString,
+  nativeSession: NativeSessionPreparationReceipt,
+});
+export type ProviderSessionPreparationReceipt = typeof ProviderSessionPreparationReceipt.Type;
+
+const SessionPreparationFailureReason = Schema.Literals([
+  "binding_changed",
+  "owner_busy",
+  "request_expired",
+  "attachment_failed",
+]);
+
+export const ProviderSessionPreparation = Schema.Struct({
+  ...PrepareProviderSessionInput.fields,
+  receipt: Schema.optional(ProviderSessionPreparationReceipt),
+  failure: Schema.optional(SessionPreparationFailureReason),
+  /** A native result or confirmed Stop retired this operation's hold. */
+  consumedByRunId: Schema.optional(RunId),
+  /** Until a native result, only reattachment to that same operation may proceed. */
+  dispatchingRunId: Schema.optional(RunId),
+  /** A failed refresh must retain a previously established inspection hold. */
+  holdRequired: Schema.optional(Schema.Literal(true)),
+});
+export type ProviderSessionPreparation = typeof ProviderSessionPreparation.Type;
+
+export class PrepareProviderSessionError extends Schema.TaggedError<PrepareProviderSessionError>()(
+  "PrepareProviderSessionError",
+  {
+    threadId: ThreadId,
+    reason: SessionPreparationFailureReason,
+  },
+) {
+  override get message(): string {
+    return `Provider session preparation is held: ${this.reason}.`;
+  }
+}
+
 export const OrchestrationV2AppThread = Schema.Struct({
   ...OrchestrationV2CreationFields,
+  /** Survives process loss so a retained-work continuation cannot silently start elsewhere. */
+  sessionPreparation: Schema.optional(ProviderSessionPreparation),
   id: ThreadId,
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
@@ -559,6 +620,8 @@ export const OrchestrationV2Run = Schema.Struct({
   contextHandoffId: Schema.NullOr(ContextHandoffId),
   /** Links server-generated restart continuations to the interrupted run. */
   restartContinuationOfRunId: Schema.optional(RunId),
+  /** This run joined retained native work and delivered no new prompt or background-loss note. */
+  retainedDispatchOfRunId: Schema.optional(RunId),
   /**
    * Set on wake runs (background notifications, delegated task results,
    * restart continuations): when the work they continue started. Read it
@@ -829,6 +892,16 @@ export type OrchestrationV2PendingBackgroundTask = typeof OrchestrationV2Pending
 
 /** Provider and adapter metadata that should not overwrite the app thread's title. */
 export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
+  /** Durable ACP prompt identity and the last fully projected journal notification. */
+  acpDurablePrompt: Schema.optional(
+    Schema.Struct({
+      turnId: TrimmedNonEmptyString,
+      nativeTurnId: TrimmedNonEmptyString,
+      sequence: NonNegativeInt,
+      /** App run that persisted this identity, separating a continuation chain from stale metadata. */
+      runId: Schema.optional(RunId),
+    }),
+  ),
   /** Provider-reported selection for display, separate from the app's saved preferences. */
   modelSelection: Schema.optional(ModelSelection),
   title: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
@@ -2847,6 +2920,7 @@ export const OrchestrationV2Command = Schema.Union([
     titleSeed: Schema.optional(TrimmedNonEmptyString),
     modelSelection: Schema.optional(ModelSelection),
     sourcePlanRef: Schema.optional(Schema.Struct({ threadId: ThreadId, planId: PlanId })),
+    /** Explicit non-server recovery can also attach this thread's held terminal dispatch. */
     restartContinuationOfRunId: Schema.optional(RunId),
     usageLimitContinuationOfRunId: Schema.optional(RunId),
     manualContinuationOfRunId: Schema.optional(RunId),
@@ -3133,6 +3207,7 @@ export type OrchestrationV2InternalCommand = typeof OrchestrationV2InternalComma
 export type OrchestrationV2ServerCommand = OrchestrationV2Command | OrchestrationV2InternalCommand;
 
 export const ORCHESTRATION_V2_WS_METHODS = {
+  prepareProviderSession: "orchestration.prepareProviderSession",
   dispatchCommand: "orchestration.dispatchCommand",
   getTurnDiff: "orchestration.getTurnDiff",
   getFullThreadDiff: "orchestration.getFullThreadDiff",

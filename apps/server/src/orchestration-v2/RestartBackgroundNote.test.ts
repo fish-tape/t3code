@@ -44,6 +44,33 @@ const turnFor = (source: OrchestrationV2Run) => ({
   status: "completed" as const,
 });
 
+it("keeps the cancelled background-work note until a real prompt follows retained reattachment", () => {
+  const original = run(1, claudeThread, {
+    status: "cancelled",
+    restartCancelledBackgroundWork: lost,
+  });
+  const attached = run(2, claudeThread, {
+    restartContinuationOfRunId: original.id,
+    retainedDispatchOfRunId: original.id,
+  });
+  const next = run(3, claudeThread);
+  const later = run(4, claudeThread);
+  const pending = (
+    target: OrchestrationV2Run,
+    runs: OrchestrationV2Run[],
+    delivered: OrchestrationV2Run[],
+  ) =>
+    pendingRestartCancelledBackgroundWork({
+      runs,
+      providerTurns: delivered.map(turnFor),
+      compactionMessageIds: new Set(),
+      run: target,
+      attempts: [],
+    });
+  assert.deepEqual(pending(next, [original, attached, next], [attached]), lost);
+  assert.deepEqual(pending(later, [original, attached, next, later], [attached, next]), []);
+});
+
 it("keeps the note for the provider thread that lost the work across a provider switch", () => {
   const root = run(1, claudeThread, { restartCancelledBackgroundWork: lost });
   const onCodex = run(2, codexThread);
