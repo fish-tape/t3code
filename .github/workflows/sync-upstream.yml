@@ -1,14 +1,19 @@
 name: Sync upstream T3 Code
 
 on:
-  # The Fish Tape upstream poller dispatches this workflow after it observes a
-  # new upstream commit. Keeping the merge logic here makes the GitHub token
-  # and conflict reporting local to the fork.
+  schedule:
+    # Daily. A run that cannot land the merge files the issue the weekly
+    # Fish Tape upstream monitor resolves.
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
   issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
 
 jobs:
   sync:
@@ -16,11 +21,17 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       UPSTREAM_REPOSITORY: pingdotgg/t3code
+      ISSUE_TITLE: Upstream T3 Code sync conflict
     steps:
       - name: Check out the fork
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # GITHUB_TOKEN cannot push commits that change .github/workflows, and
+          # upstream changes them often. UPSTREAM_SYNC_TOKEN (contents and
+          # workflows write on this repository) lets the push through; without
+          # it, those pushes are refused and reported below.
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
 
       - name: Merge upstream main
         id: merge
@@ -32,38 +43,64 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
           git fetch --no-tags upstream main
+          echo "upstream-sha=$(git rev-parse upstream/main)" >> "$GITHUB_OUTPUT"
 
           if git merge-base --is-ancestor upstream/main HEAD; then
-            echo "already-current=true" >> "$GITHUB_OUTPUT"
+            echo "Already current with upstream."
             exit 0
           fi
 
-          if git merge-base --is-ancestor HEAD upstream/main; then
-            git reset --hard upstream/main
-          elif ! git merge --no-edit upstream/main; then
+          if ! git merge --no-edit upstream/main; then
+            {
+              echo "reason=conflict"
+              echo "files<<EOF"
+              git diff --name-only --diff-filter=U
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
             git merge --abort || true
-            echo "conflict=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          git push origin HEAD:main
+          if ! git push origin HEAD:main; then
+            echo "reason=push-refused" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-      - name: Report a merge conflict
-        if: steps.merge.outputs.conflict == 'true'
+      - name: Report a sync that could not land
+        if: steps.merge.outputs.reason != ''
         shell: bash
+        env:
+          REASON: ${{ steps.merge.outputs.reason }}
+          FILES: ${{ steps.merge.outputs.files }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream-sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          title="Upstream T3 Code sync conflict"
-          existing="$(gh issue list --state open --search \"$title in:title\" --json number --jq 'length')"
-          if [ "$existing" = "0" ]; then
-            body="$RUNNER_TEMP/upstream-sync-conflict.md"
-            cat > "$body" <<'EOF'
-          The scheduled upstream sync could not merge `pingdotgg/t3code:main` into this fork.
+          body="$RUNNER_TEMP/upstream-sync.md"
+          {
+            echo "The upstream sync could not land \`${UPSTREAM_REPOSITORY}@${UPSTREAM_SHA}\` on \`main\`."
+            echo
+            if [ "$REASON" = "conflict" ]; then
+              echo "The merge conflicts in:"
+              echo
+              printf '%s\n' "$FILES" | sed 's/^/- `/; s/$/`/'
+            else
+              echo "The merge was clean, but pushing it to \`main\` was refused. This usually means upstream"
+              echo "changed \`.github/workflows\` and the \`UPSTREAM_SYNC_TOKEN\` secret is missing or lacks"
+              echo "workflows write access."
+            fi
+            echo
+            echo "Run: $RUN_URL"
+            echo
+            echo "Merge \`upstream/main\` into \`main\` without rewriting history, keeping the Fish Tape"
+            echo "provider preset, then close this issue."
+          } > "$body"
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
 
-          Update the Fish Tape provider changes against the latest upstream T3 Code commit, then
-          close this issue so the next scheduled run can resume automatic syncing.
-          EOF
-            gh issue create --title "$title" --body-file "$body"
+          existing="$(gh issue list --state open --search "\"$ISSUE_TITLE\" in:title" --json number --jq '.[0].number // empty')"
+          # One open issue at a time; later runs only fail until it is closed.
+          if [ -z "$existing" ]; then
+            gh issue create --title "$ISSUE_TITLE" --body-file "$body"
           fi
-          echo "::error::Upstream T3 Code changes conflict with the Fish Tape fork."
+          echo "::error::The upstream T3 Code sync could not land (${REASON})."
           exit 1
