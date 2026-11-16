@@ -26,6 +26,8 @@ jobs:
       - name: Check out the fork
         uses: actions/checkout@v4
         with:
+          # A manual run started from another branch must still sync main.
+          ref: main
           fetch-depth: 0
           # GITHUB_TOKEN cannot push commits that change .github/workflows, and
           # upstream changes them often. UPSTREAM_SYNC_TOKEN (contents and
